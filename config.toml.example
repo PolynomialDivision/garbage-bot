@@ -1,0 +1,45 @@
+[matrix]
+homeserver = "https://matrix.org"
+user_id = "@yourbotname:matrix.org"
+access_token = "YOUR_ACCESS_TOKEN"
+device_id = "YOUR_DEVICE_ID"
+# Optional: security key from Element's "Set up Secure Backup"
+# Needed once to self-sign the bot's device (removes "not verified by owner" warning).
+# Steps: log in as bot in Element Web → Settings → Security → Set up Secure Backup → generate key
+# After first successful run showing "Cross-signing bootstrapped", remove this line.
+# recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
+
+[bsr]
+# Option A: set schedule_id directly (faster startup).
+schedule_id = "YOUR_SCHEDULE_ID"
+
+# Option B: let the bot resolve it from your street address at startup.
+# Comment out schedule_id above and uncomment these:
+# street = "Musterstraße"
+# number = "1"
+
+[reminder]
+# Local time (24h) to send the reminder the evening before pickup
+reminder_time = "20:00"
+
+[security]
+# Users allowed to issue !reset-trust @user:server
+admin_users = ["@you:matrix.org"]
+
+# Only these users may invite the bot to a room.
+# If empty, the bot accepts invites from everyone (not recommended).
+allowed_inviters = ["@you:matrix.org"]
+
+# Which devices receive room keys:
+#   identity_based  — only cross-signed devices (default, recommended)
+#   only_trusted    — only explicitly verified devices
+#   all_devices     — all devices, no restriction
+encryption_strategy = "all_devices"
+
+# Waste type labels (override to customise names shown in reminders)
+[waste_labels]
+HM = "Hausmüll (grau)"
+BI = "Biotonne (braun)"
+WS = "Wertstoffe / Gelber Sack"
+LT = "Laubtonne"
+WB = "Weihnachtsbaum"
