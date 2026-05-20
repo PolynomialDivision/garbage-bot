@@ -41,9 +41,13 @@ struct Config {
     matrix: MatrixConfig,
     bsr: BsrConfig,
     #[serde(default)]
+    berlin_recycling: Option<BerlinRecyclingConfig>,
+    #[serde(default)]
     reminder: ReminderConfig,
     #[serde(default)]
     waste_labels: HashMap<String, String>,
+    #[serde(default)]
+    waste_colors: HashMap<String, String>,
     #[serde(default)]
     security: SecurityConfig,
 }
@@ -55,6 +59,12 @@ struct MatrixConfig {
     access_token: String,
     device_id: String,
     recovery_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BerlinRecyclingConfig {
+    username: String,
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -228,6 +238,85 @@ async fn fetch_pickups(
     Ok(pickups)
 }
 
+// ── Berlin Recycling API ──────────────────────────────────────────────────────
+
+const BR_PORTAL: &str = "https://kundenportal.berlin-recycling.de/";
+
+async fn fetch_berlin_recycling_pickups(username: &str, password: &str, waste_labels: &HashMap<String, String>) -> Result<Vec<Pickup>> {
+    // Each call creates a fresh session — the portal is stateful via cookies.
+    let http = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()?;
+
+    // Establish session
+    http.get(BR_PORTAL).send().await?;
+
+    // Login
+    let resp = http.post(format!("{BR_PORTAL}Login.aspx/Auth"))
+        .json(&serde_json::json!({
+            "username": username,
+            "password": password,
+            "rememberMe": false,
+            "encrypted": false,
+        }))
+        .send()
+        .await?;
+    resp.error_for_status()?;
+
+    // Verify login didn't redirect away
+    let check = http.get(format!("{BR_PORTAL}Default.aspx")).send().await?;
+    if check.url().host_str() != Some("kundenportal.berlin-recycling.de") {
+        return Err(anyhow!("Berlin Recycling login failed — redirected to {}", check.url()));
+    }
+
+    // Required portal handshake
+    http.post(format!("{BR_PORTAL}Default.aspx/GetDashboard"))
+        .header("Content-Type", "application/json")
+        .send()
+        .await?;
+
+    // Fetch the collection calendar
+    let resp = http.post(format!("{BR_PORTAL}Default.aspx/GetDatasetTableHead"))
+        .json(&serde_json::json!({
+            "datasettablecode": "ABFUHRKALENDER",
+            "startindex": 0,
+            "searchtext": "",
+            "rangefilter": "[]",
+            "ordername": "",
+            "orderdir": "",
+            "ClientParameters": "",
+            "headrecid": "",
+        }))
+        .send()
+        .await?;
+
+    // Response is double-encoded: outer JSON has a "d" key containing a JSON string.
+    let outer: serde_json::Value = resp.json().await?;
+    let inner_str = outer["d"].as_str()
+        .ok_or_else(|| anyhow!("Berlin Recycling: unexpected response shape (missing 'd')"))?;
+    let inner: serde_json::Value = serde_json::from_str(inner_str)?;
+
+    let data = inner["Object"]["data"].as_array()
+        .ok_or_else(|| anyhow!("Berlin Recycling: no data array in response"))?;
+
+    let mut pickups: Vec<Pickup> = data.iter()
+        .filter_map(|d| {
+            let date = NaiveDate::parse_from_str(d["Task Date"].as_str()?, "%Y-%m-%d").ok()?;
+            let raw = d["Material Description"].as_str()?;
+            // Strip leading category code like "5.01 " from the material description.
+            let stripped = match raw.split_once(' ') {
+                Some((code, rest)) if code.contains('.') && code.chars().all(|c| c.is_ascii_digit() || c == '.') => rest,
+                _ => raw,
+            };
+            let label = waste_labels.get(stripped).cloned().unwrap_or_else(|| stripped.to_owned());
+            Some(Pickup { date, label })
+        })
+        .collect();
+
+    pickups.sort_by_key(|p| p.date);
+    Ok(pickups)
+}
+
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -237,7 +326,9 @@ struct BotState {
     allowed_inviters: HashSet<OwnedUserId>,
     reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
     bsr_schedule_id: String,
+    berlin_recycling_creds: Option<(String, String)>,
     waste_labels: HashMap<String, String>,
+    waste_colors: HashMap<String, String>,
     reminder_hour: u32,
     reminder_minute: u32,
     http: reqwest::Client,
@@ -247,22 +338,26 @@ struct BotState {
 
 // ── Message formatting ────────────────────────────────────────────────────────
 
-fn build_reminder(pickups: &[Pickup], pickup_date: NaiveDate) -> (String, String) {
+fn build_reminder(pickups: &[Pickup], pickup_date: NaiveDate, colors: &HashMap<String, String>) -> (String, String) {
     let day = pickup_date.format("%A, %d.%m.%Y").to_string();
 
     let plain_bins: String =
-        pickups.iter().map(|p| format!("  🗑️  {}\n", p.label)).collect();
-    let html_bins: String =
-        pickups.iter().map(|p| format!("<li>🗑️ <b>{}</b></li>", p.label)).collect();
+        pickups.iter().map(|p| format!("🗑️ {}\n", p.label)).collect();
+    let html_bins: String = pickups.iter().map(|p| {
+        match colors.get(&p.label) {
+            Some(color) => format!("<li>🗑️ <font data-mx-color=\"{color}\"><strong>{}</strong></font></li>", p.label),
+            None        => format!("<li>🗑️ <strong>{}</strong></li>", p.label),
+        }
+    }).collect();
 
     let plain = format!(
-        "📢 Garbage Collection Reminder\n\nTomorrow ({day}) these bins will be collected:\n\n{plain_bins}\nPlease put them out tonight!\nReact with ✅ once it's done."
+        "📢 Garbage Collection Reminder\nTomorrow ({day}):\n{plain_bins}Please put them out tonight!\nReact with ✅ once it's done."
     );
     let html = format!(
-        "<h3>📢 Garbage Collection Reminder</h3>\
-         <p>Tomorrow <b>{day}</b> the following bins will be collected:</p>\
+        "<strong>📢 Garbage Collection Reminder</strong>\
+         <p>Tomorrow <b>{day}</b>:</p>\
          <ul>{html_bins}</ul>\
-         <p>🌙 Please put them out <b>tonight</b>!<br>\
+         <p>Please put them out <b>tonight</b>!<br>\
          React with ✅ once it's done.</p>"
     );
     (plain, html)
@@ -277,13 +372,24 @@ const DONE_REACTIONS: &[&str] = &["✅", "✔", "☑"];
 // ── Core logic ────────────────────────────────────────────────────────────────
 
 async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
-    let pickups = match fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await {
+    let mut pickups = match fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await {
         Ok(p) => p,
         Err(e) => {
             error!("Failed to fetch BSR data: {e}");
             return;
         }
     };
+
+    if let Some((ref user, ref pass)) = state.berlin_recycling_creds {
+        match fetch_berlin_recycling_pickups(user, pass, &state.waste_labels).await {
+            Ok(br_pickups) => {
+                info!("Berlin Recycling: {} pickup(s) fetched", br_pickups.len());
+                pickups.extend(br_pickups);
+                pickups.sort_by_key(|p| p.date);
+            }
+            Err(e) => error!("Failed to fetch Berlin Recycling data: {e}"),
+        }
+    }
 
     let today = Local::now().date_naive();
     let tomorrow = today + chrono::Duration::days(1);
@@ -323,7 +429,7 @@ async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
         tries += 1;
     };
 
-    let (plain, html) = build_reminder(&day_pickups, pickup_date);
+    let (plain, html) = build_reminder(&day_pickups, pickup_date, &state.waste_colors);
     for room in rooms {
         match room.send(RoomMessageEventContent::text_html(plain.clone(), html.clone())).await {
             Ok(resp) => {
@@ -469,13 +575,21 @@ async fn main() -> Result<()> {
         info!("Allowed inviters: {allowed_inviters:?}");
     }
 
+    let berlin_recycling_creds = config.berlin_recycling
+        .map(|br| (br.username, br.password));
+    if berlin_recycling_creds.is_some() {
+        info!("Berlin Recycling credentials configured — paper pickups enabled");
+    }
+
     let state = BotState {
         bot_user_id: user_id,
         admin_users,
         allowed_inviters,
         reset_allowed: Arc::new(Mutex::new(HashSet::new())),
         bsr_schedule_id: schedule_id,
+        berlin_recycling_creds,
         waste_labels: config.waste_labels,
+        waste_colors: config.waste_colors,
         reminder_hour,
         reminder_minute,
         http: reqwest::Client::new(),

@@ -19,6 +19,15 @@ plz = "12345"
 # Option B: set schedule_id directly (faster startup, skip the API lookup).
 # schedule_id = "YOUR_SCHEDULE_ID"
 
+# Optional: Berlin Recycling customer portal for paper (Altpapier) collection.
+# If omitted, only BSR pickups are tracked.
+# Register at https://kundenportal.berlin-recycling.de/
+[berlin_recycling]
+username = "your@email.de"
+password = "yourpassword"
+# If your password contains backslashes or special chars, use single quotes:
+# password = 'your\password'
+
 [reminder]
 # Local time (24h) to send the reminder the evening before pickup
 reminder_time = "20:00"
@@ -44,3 +53,14 @@ BI = "Biotonne (braun)"
 WS = "Wertstoffe / Gelber Sack"
 LT = "Laubtonne"
 WB = "Weihnachtsbaum"
+# Berlin Recycling labels (after stripping leading category code)
+"Altpapier, gemischt" = "Altpapier (blau)"
+
+# Optional: color each label in the Matrix message (HTML clients only)
+[waste_colors]
+"Hausmüll (grau)"          = "#808080"
+"Biotonne (braun)"         = "#6B8E23"
+"Wertstoffe / Gelber Sack" = "#DAA520"
+"Laubtonne"                = "#556B2F"
+"Weihnachtsbaum"           = "#006400"
+"Altpapier (blau)"         = "#4682B4"
