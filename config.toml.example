@@ -10,13 +10,14 @@ device_id = "YOUR_DEVICE_ID"
 # recovery_key = "EsXX xxxx xxxx xxxx xxxx xxxx xxxx xxxx"
 
 [bsr]
-# Option A: set schedule_id directly (faster startup).
-schedule_id = "YOUR_SCHEDULE_ID"
+# Option A: let the bot resolve your schedule_id from your address at startup.
+# The resolved ID is logged — copy it into Option B for faster future startups.
+street = "Musterstraße"
+number = "1"
+plz = "12345"
 
-# Option B: let the bot resolve it from your street address at startup.
-# Comment out schedule_id above and uncomment these:
-# street = "Musterstraße"
-# number = "1"
+# Option B: set schedule_id directly (faster startup, skip the API lookup).
+# schedule_id = "YOUR_SCHEDULE_ID"
 
 [reminder]
 # Local time (24h) to send the reminder the evening before pickup

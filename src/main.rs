@@ -62,6 +62,7 @@ struct BsrConfig {
     schedule_id: Option<String>,
     street: Option<String>,
     number: Option<String>,
+    plz: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -154,7 +155,7 @@ struct BsrPickupEntry {
     category: String,
 }
 
-async fn resolve_schedule_id(http: &reqwest::Client, street: &str, number: &str) -> Result<String> {
+async fn resolve_schedule_id(http: &reqwest::Client, street: &str, number: &str, plz: Option<&str>) -> Result<String> {
     let url = Url::parse_with_params(BSR_STREETS, &[("searchQuery", street)])?;
     let streets: Vec<BsrStreetEntry> = http.get(url).send().await?.json().await?;
 
@@ -175,12 +176,21 @@ async fn resolve_schedule_id(http: &reqwest::Client, street: &str, number: &str)
     if results.len() == 1 {
         return Ok(results[0].value.clone());
     }
-    // Prefer exact number match
-    for entry in &results {
-        if entry.label.split(',').next().unwrap_or("").trim().ends_with(&format!(" {number}")) {
+
+    // Multiple results — log them all so the user can identify the right one.
+    info!("Multiple BSR addresses found for {} {}:", matched.value, number);
+    for (i, e) in results.iter().enumerate() {
+        info!("  [{i}] {} (id: {})", e.label, e.value);
+    }
+
+    // Prefer the entry whose label contains the configured PLZ.
+    if let Some(plz) = plz {
+        if let Some(entry) = results.iter().find(|e| e.label.contains(plz)) {
             return Ok(entry.value.clone());
         }
+        warn!("PLZ {plz} not found in any result — falling back to first entry");
     }
+
     Ok(results[0].value.clone())
 }
 
@@ -375,9 +385,11 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("Config: set [bsr] schedule_id OR street + number"))?;
             let number = config.bsr.number.as_deref()
                 .ok_or_else(|| anyhow!("Config: set [bsr] schedule_id OR street + number"))?;
-            info!("Resolving BSR schedule_id for {street} {number}...");
+            let plz = config.bsr.plz.as_deref();
+            info!("Resolving BSR schedule_id for {street} {number}{}...",
+                plz.map(|p| format!(", PLZ {p}")).unwrap_or_default());
             let http = reqwest::Client::new();
-            let id = resolve_schedule_id(&http, street, number).await?;
+            let id = resolve_schedule_id(&http, street, number, plz).await?;
             info!("Resolved schedule_id: {id}");
             id
         }
