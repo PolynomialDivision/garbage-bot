@@ -48,19 +48,20 @@ encryption_strategy = "all_devices"
 
 # Waste type labels (override to customise names shown in reminders)
 [waste_labels]
-HM = "Hausmüll (grau)"
-BI = "Biotonne (braun)"
-WS = "Wertstoffe / Gelber Sack"
-LT = "Laubtonne"
-WB = "Weihnachtsbaum"
+# BSR codes
+HM = "Residual Waste (grey)"
+BI = "Organic Waste (brown)"
+WS = "Recyclables (yellow)"
+LT = "Garden Waste (green)"
+WB = "Christmas Tree"
 # Berlin Recycling labels (after stripping leading category code)
-"Altpapier, gemischt" = "Altpapier (blau)"
+"Altpapier, gemischt" = "Paper (blue)"
 
 # Optional: color each label in the Matrix message (HTML clients only)
 [waste_colors]
-"Hausmüll (grau)"          = "#808080"
-"Biotonne (braun)"         = "#6B8E23"
-"Wertstoffe / Gelber Sack" = "#DAA520"
-"Laubtonne"                = "#556B2F"
-"Weihnachtsbaum"           = "#006400"
-"Altpapier (blau)"         = "#4682B4"
+"Residual Waste (grey)"  = "#808080"
+"Organic Waste (brown)"  = "#6B8E23"
+"Recyclables (yellow)"   = "#DAA520"
+"Garden Waste (green)"   = "#556B2F"
+"Christmas Tree"         = "#006400"
+"Paper (blue)"           = "#4682B4"

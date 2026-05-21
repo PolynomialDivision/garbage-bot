@@ -28,7 +28,7 @@ use matrix_sdk::{
         },
     },
 };
-use matrix_sdk_base::crypto::CollectStrategy;
+use matrix_sdk_crypto::CollectStrategy;
 use serde::Deserialize;
 use url::Url;
 use tokio::{fs, sync::Mutex, time::sleep};
