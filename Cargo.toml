@@ -21,3 +21,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 futures-util = "0.3"
 chrono = "0.4"
 url = "2"
+mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
