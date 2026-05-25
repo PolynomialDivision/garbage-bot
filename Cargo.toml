@@ -22,3 +22,10 @@ futures-util = "0.3"
 chrono = "0.4"
 url = "2"
 mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
+
+[patch.crates-io]
+matrix-sdk        = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
+matrix-sdk-base   = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
+matrix-sdk-common = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
+matrix-sdk-crypto = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
+matrix-sdk-sqlite = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
