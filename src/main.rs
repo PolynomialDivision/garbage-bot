@@ -15,7 +15,8 @@ use matrix_sdk::{
         api::client::filter::FilterDefinition,
         events::{
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
-            reaction::OriginalSyncReactionEvent,
+            reaction::{OriginalSyncReactionEvent, ReactionEventContent},
+            relation::Annotation,
             room::{
                 member::StrippedRoomMemberEvent,
                 message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
@@ -384,8 +385,16 @@ async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
     for room in rooms {
         match room.send(RoomMessageEventContent::text_html(plain.clone(), html.clone())).await {
             Ok(resp) => {
-                info!("Sent reminder to {}, event_id={}", room.room_id(), resp.response.event_id);
-                state.confirmed.lock().await.insert(resp.response.event_id, HashSet::new());
+                let event_id = resp.response.event_id;
+                info!("Sent reminder to {}, event_id={}", room.room_id(), event_id);
+                state.confirmed.lock().await.insert(event_id.clone(), HashSet::new());
+                // React with ✅ so users see a button they can click immediately.
+                let reaction = ReactionEventContent::new(
+                    Annotation::new(event_id, "✅".to_owned()),
+                );
+                if let Err(e) = room.send(reaction).await {
+                    warn!("Failed to react to reminder: {e}");
+                }
             }
             Err(e) => error!("Failed to send reminder to {}: {e}", room.room_id()),
         }
@@ -698,6 +707,11 @@ async fn main() -> Result<()> {
 // ── Reaction handler ──────────────────────────────────────────────────────────
 
 async fn handle_reaction(state: BotState, room: Room, ev: OriginalSyncReactionEvent) {
+    // Ignore the bot's own seed reaction — it only exists to show users the button.
+    if ev.sender == state.bot_user_id {
+        return;
+    }
+
     let related_id = &ev.content.relates_to.event_id;
     let key = strip_variation_selectors(&ev.content.relates_to.key);
 
