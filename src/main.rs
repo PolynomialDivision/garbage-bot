@@ -14,6 +14,7 @@ use matrix_sdk::{
         OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
         api::client::filter::FilterDefinition,
         events::{
+            Mentions,
             key::verification::request::ToDeviceKeyVerificationRequestEvent,
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
             relation::Annotation,
@@ -290,11 +291,50 @@ struct BotState {
 
 // ── Message formatting ────────────────────────────────────────────────────────
 
+/// Map a `#RRGGBB` hex color to the closest colored-circle emoji.
+fn hex_to_dot(hex: &str) -> &'static str {
+    let s = hex.trim_start_matches('#');
+    let Ok(n) = u32::from_str_radix(&s[..s.len().min(6)], 16) else {
+        return "🗑️";
+    };
+    if s.len() < 6 { return "🗑️"; }
+    let r = ((n >> 16) & 0xff) as f32;
+    let g = ((n >>  8) & 0xff) as f32;
+    let b = ( n        & 0xff) as f32;
+
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let chroma = max - min;
+
+    if chroma < 40.0 { return "⚫"; }
+
+    let hue = if max == r {
+        let h = 60.0 * (g - b) / chroma;
+        if h < 0.0 { h + 360.0 } else { h }
+    } else if max == g {
+        60.0 * ((b - r) / chroma + 2.0)
+    } else {
+        60.0 * ((r - g) / chroma + 4.0)
+    };
+
+    // Brown is dark orange (hue ~15–40°, low brightness).
+    match hue as u32 {
+        330..=360 | 0..=14              => "🔴",
+        15..=40 if max < 180.0          => "🟤",
+        15..=75                         => "🟡",
+        76..=165                        => "🟢",
+        166..=255                       => "🔵",
+        _                               => "🟣",
+    }
+}
+
 fn build_reminder(pickups: &[Pickup], pickup_date: NaiveDate, colors: &HashMap<String, String>) -> (String, String) {
     let day = pickup_date.format("%A, %d.%m.%Y").to_string();
 
-    let plain_bins: String =
-        pickups.iter().map(|p| format!("🗑️ {}\n", p.label)).collect();
+    let plain_bins: String = pickups.iter().map(|p| {
+        let dot = colors.get(&p.label).map(|c| hex_to_dot(c)).unwrap_or("🗑️");
+        format!("{dot} {}\n", p.label)
+    }).collect();
     let html_bins: String = pickups.iter().map(|p| {
         match colors.get(&p.label) {
             Some(color) => format!("<li>🗑️ <font data-mx-color=\"{color}\"><strong>{}</strong></font></li>", p.label),
@@ -303,14 +343,10 @@ fn build_reminder(pickups: &[Pickup], pickup_date: NaiveDate, colors: &HashMap<S
     }).collect();
 
     let plain = format!(
-        "📢 Garbage Collection Reminder\nTomorrow ({day}):\n{plain_bins}Please put them out tonight!\nReact with ✅ once it's done."
+        "@room\n🗑️ Tomorrow ({day}):\n{plain_bins}Put them out tonight · click ✅ when done"
     );
     let html = format!(
-        "<strong>📢 Garbage Collection Reminder</strong>\
-         <p>Tomorrow <b>{day}</b>:</p>\
-         <ul>{html_bins}</ul>\
-         <p>Please put them out <b>tonight</b>!<br>\
-         React with ✅ once it's done.</p>"
+        "@room<br>🗑️ Tomorrow <b>{day}</b>:<ul>{html_bins}</ul>Put them out tonight · click ✅ when done"
     );
     (plain, html)
 }
@@ -383,7 +419,11 @@ async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
 
     let (plain, html) = build_reminder(&day_pickups, pickup_date, &state.waste_colors);
     for room in rooms {
-        match room.send(RoomMessageEventContent::text_html(plain.clone(), html.clone())).await {
+        let mut content = RoomMessageEventContent::text_html(plain.clone(), html.clone());
+        let mut mentions = Mentions::new();
+        mentions.room = true;
+        content = content.add_mentions(mentions);
+        match room.send(content).await {
             Ok(resp) => {
                 let event_id = resp.response.event_id;
                 info!("Sent reminder to {}, event_id={}", room.room_id(), event_id);
