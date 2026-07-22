@@ -359,14 +359,11 @@ const DONE_REACTIONS: &[&str] = &["✅", "✔", "☑"];
 
 // ── Core logic ────────────────────────────────────────────────────────────────
 
-async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
-    let mut pickups = match fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await {
-        Ok(p) => p,
-        Err(e) => {
-            error!("Failed to fetch BSR data: {e}");
-            return;
-        }
-    };
+/// Fetch and merge pickups from all configured sources, sorted by date.
+/// A BSR failure is fatal (it's the primary source); a Berlin Recycling
+/// failure is logged and skipped so the reminder still fires with BSR data.
+async fn fetch_all_pickups(state: &BotState) -> Result<Vec<Pickup>> {
+    let mut pickups = fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await?;
 
     if let Some((ref user, ref pass)) = state.berlin_recycling_creds {
         match fetch_berlin_recycling_pickups(user, pass, &state.waste_labels).await {
@@ -378,6 +375,18 @@ async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
             Err(e) => error!("Failed to fetch Berlin Recycling data: {e}"),
         }
     }
+
+    Ok(pickups)
+}
+
+async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
+    let pickups = match fetch_all_pickups(state).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to fetch BSR data: {e}");
+            return;
+        }
+    };
 
     let today = Local::now().date_naive();
     let tomorrow = today + chrono::Duration::days(1);
@@ -466,6 +475,187 @@ async fn scheduler_loop(state: BotState, client: Client, test_mode: bool) {
         );
         sleep(Duration::from_secs(secs)).await;
         check_and_remind(&state, &client, false).await;
+    }
+}
+
+// ── !garbage command ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GarbageCommand {
+    /// `!garbage` — next upcoming pickup for each waste type.
+    NextPerType,
+    /// `!garbage next` — only the single nearest pickup event.
+    NextEvent,
+    /// `!garbage week` — every pickup in the next 7 days.
+    Week,
+    /// `!garbage help` (or an unrecognized subcommand) — usage text.
+    Help,
+}
+
+fn parse_garbage_command(body: &str) -> Option<GarbageCommand> {
+    let lower = body.trim().to_ascii_lowercase();
+    if lower == "!garbage" {
+        return Some(GarbageCommand::NextPerType);
+    }
+    let rest = lower.strip_prefix("!garbage ")?.trim();
+    Some(match rest {
+        "" => GarbageCommand::NextPerType,
+        "next" => GarbageCommand::NextEvent,
+        "week" => GarbageCommand::Week,
+        _ => GarbageCommand::Help,
+    })
+}
+
+/// Remove duplicate (date, label) pairs — the BSR and Berlin Recycling feeds
+/// can list the same pickup twice if their configured labels collide.
+fn dedup_pickups(pickups: Vec<Pickup>) -> Vec<Pickup> {
+    let mut seen: HashSet<(NaiveDate, String)> = HashSet::new();
+    pickups
+        .into_iter()
+        .filter(|p| seen.insert((p.date, p.label.clone())))
+        .collect()
+}
+
+/// Earliest upcoming date per waste type, sorted chronologically
+/// (ties broken by label for a stable order).
+fn next_pickup_per_type(pickups: &[Pickup], today: NaiveDate) -> Vec<Pickup> {
+    let mut next_by_label: HashMap<String, NaiveDate> = HashMap::new();
+    for p in pickups {
+        if p.date < today {
+            continue;
+        }
+        next_by_label
+            .entry(p.label.clone())
+            .and_modify(|d| {
+                if p.date < *d {
+                    *d = p.date;
+                }
+            })
+            .or_insert(p.date);
+    }
+    let mut result: Vec<Pickup> = next_by_label
+        .into_iter()
+        .map(|(label, date)| Pickup { date, label })
+        .collect();
+    result.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.label.cmp(&b.label)));
+    result
+}
+
+/// All waste types collected on the single nearest upcoming date.
+fn next_event(pickups: &[Pickup], today: NaiveDate) -> Vec<Pickup> {
+    let Some(next_date) = pickups.iter().filter(|p| p.date >= today).map(|p| p.date).min() else {
+        return Vec::new();
+    };
+    let mut entries: Vec<Pickup> = pickups.iter().filter(|p| p.date == next_date).cloned().collect();
+    entries.sort_by(|a, b| a.label.cmp(&b.label));
+    entries
+}
+
+/// All pickups in the next 7 days (today through today + 6), chronological.
+fn pickups_this_week(pickups: &[Pickup], today: NaiveDate) -> Vec<Pickup> {
+    let end = today + chrono::Duration::days(6);
+    let mut entries: Vec<Pickup> = pickups
+        .iter()
+        .filter(|p| p.date >= today && p.date <= end)
+        .cloned()
+        .collect();
+    entries.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.label.cmp(&b.label)));
+    entries
+}
+
+/// Compact relative date for mobile display: `today` / `tomorrow` / `in N days`
+/// for the coming week, otherwise a short localized date (`Fri, 24 Jul`),
+/// with the year appended only when it differs from the current year.
+fn format_relative_date(date: NaiveDate, today: NaiveDate) -> String {
+    let days = (date - today).num_days();
+    match days {
+        0 => "today".to_owned(),
+        1 => "tomorrow".to_owned(),
+        2..=6 => format!("in {days} days"),
+        _ if date.year() == today.year() => date.format("%a, %-d %b").to_string(),
+        _ => date.format("%a, %-d %b %Y").to_string(),
+    }
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn garbage_empty_message() -> (String, String) {
+    let text = "🗑️ No upcoming collections found.".to_owned();
+    (text.clone(), text)
+}
+
+fn garbage_help_message() -> (String, String) {
+    let plain = "🗑️ !garbage — next per type\n\
+                  !garbage next — next collection\n\
+                  !garbage week — next 7 days"
+        .to_owned();
+    let html = plain.replace('\n', "<br>");
+    (plain, html)
+}
+
+/// Render a compact one-line-per-pickup list, optimized for small phone
+/// screens: no table, no long heading, `·` as separator, waste-type emoji
+/// derived from `waste_colors` (same mapping the daily reminder uses).
+fn render_garbage_list(
+    header: &str,
+    entries: &[Pickup],
+    today: NaiveDate,
+    colors: &HashMap<String, String>,
+) -> (String, String) {
+    if entries.is_empty() {
+        return garbage_empty_message();
+    }
+
+    let mut plain = format!("🗑️ {header}\n\n");
+    let mut html = format!("🗑️ <b>{}</b><br><br>", escape_html(header));
+
+    for (i, p) in entries.iter().enumerate() {
+        let dot = colors.get(&p.label).map(|c| hex_to_dot(c)).unwrap_or("🗑️");
+        let rel = format_relative_date(p.date, today);
+        plain.push_str(&format!("{dot} {} · {rel}", p.label));
+        html.push_str(&format!("{dot} {} · {rel}", escape_html(&p.label)));
+        if i + 1 < entries.len() {
+            plain.push('\n');
+            html.push_str("<br>");
+        }
+    }
+
+    (plain, html)
+}
+
+fn build_garbage_reply(cmd: GarbageCommand, pickups: &[Pickup], today: NaiveDate, colors: &HashMap<String, String>) -> (String, String) {
+    match cmd {
+        GarbageCommand::NextPerType => render_garbage_list("Next collections", &next_pickup_per_type(pickups, today), today, colors),
+        GarbageCommand::NextEvent => render_garbage_list("Next collection", &next_event(pickups, today), today, colors),
+        GarbageCommand::Week => render_garbage_list("Next 7 days", &pickups_this_week(pickups, today), today, colors),
+        GarbageCommand::Help => garbage_help_message(),
+    }
+}
+
+async fn handle_garbage_command(state: BotState, room: Room, cmd: GarbageCommand) {
+    let (plain, html) = if cmd == GarbageCommand::Help {
+        garbage_help_message()
+    } else {
+        match fetch_all_pickups(&state).await {
+            Ok(pickups) => {
+                let pickups = dedup_pickups(pickups);
+                let today = Local::now().date_naive();
+                build_garbage_reply(cmd, &pickups, today, &state.waste_colors)
+            }
+            Err(e) => {
+                error!("!garbage: failed to fetch pickups: {e}");
+                garbage_empty_message()
+            }
+        }
+    };
+
+    if let Err(e) = room.send(RoomMessageEventContent::text_html(plain, html)).await {
+        error!("Failed to send !garbage reply: {e}");
     }
 }
 
@@ -685,6 +875,8 @@ async fn main() -> Result<()> {
                     } else {
                         warn!("!reset-trust from non-admin {} — ignored", ev.sender);
                     }
+                } else if let Some(cmd) = parse_garbage_command(raw) {
+                    tokio::spawn(handle_garbage_command(state.clone(), room, cmd));
                 }
             }
         }
@@ -789,6 +981,201 @@ async fn handle_reaction(state: BotState, room: Room, ev: OriginalSyncReactionEv
 
     if let Err(e) = room.send(RoomMessageEventContent::text_plain(msg)).await {
         error!("Failed to send confirmation: {e}");
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 7, 20).unwrap() // fixed: a Monday
+    }
+
+    fn colors() -> HashMap<String, String> {
+        HashMap::from([
+            ("Organic".to_owned(), "#8B4513".to_owned()),
+            ("Paper".to_owned(), "#4682B4".to_owned()),
+            ("Residual".to_owned(), "#808080".to_owned()),
+            ("Recycling".to_owned(), "#DAA520".to_owned()),
+        ])
+    }
+
+    fn pickup(days_from_today: i64, label: &str) -> Pickup {
+        Pickup { date: today() + chrono::Duration::days(days_from_today), label: label.to_owned() }
+    }
+
+    // ── Command parsing ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parses_bare_command_as_next_per_type() {
+        assert_eq!(parse_garbage_command("!garbage"), Some(GarbageCommand::NextPerType));
+        assert_eq!(parse_garbage_command("  !garbage  "), Some(GarbageCommand::NextPerType));
+        assert_eq!(parse_garbage_command("!garbage "), Some(GarbageCommand::NextPerType));
+    }
+
+    #[test]
+    fn parses_subcommands_case_insensitively() {
+        assert_eq!(parse_garbage_command("!garbage next"), Some(GarbageCommand::NextEvent));
+        assert_eq!(parse_garbage_command("!GARBAGE NEXT"), Some(GarbageCommand::NextEvent));
+        assert_eq!(parse_garbage_command("!garbage week"), Some(GarbageCommand::Week));
+        assert_eq!(parse_garbage_command("!garbage help"), Some(GarbageCommand::Help));
+    }
+
+    #[test]
+    fn unknown_subcommand_falls_back_to_help() {
+        assert_eq!(parse_garbage_command("!garbage bogus"), Some(GarbageCommand::Help));
+    }
+
+    #[test]
+    fn ignores_unrelated_messages() {
+        assert_eq!(parse_garbage_command("hello"), None);
+        assert_eq!(parse_garbage_command("!garbagefoo"), None);
+        assert_eq!(parse_garbage_command("!reset-trust @x:y"), None);
+    }
+
+    // ── Relative date formatting ──────────────────────────────────────────────
+
+    #[test]
+    fn relative_date_near_term() {
+        assert_eq!(format_relative_date(today(), today()), "today");
+        assert_eq!(format_relative_date(today() + chrono::Duration::days(1), today()), "tomorrow");
+        assert_eq!(format_relative_date(today() + chrono::Duration::days(2), today()), "in 2 days");
+        assert_eq!(format_relative_date(today() + chrono::Duration::days(6), today()), "in 6 days");
+    }
+
+    #[test]
+    fn relative_date_further_out_uses_compact_date_without_year() {
+        // today() + 7 days = 2026-07-27, same year as today() -> no year shown.
+        let d = today() + chrono::Duration::days(7);
+        assert_eq!(format_relative_date(d, today()), "Mon, 27 Jul");
+    }
+
+    #[test]
+    fn relative_date_next_year_includes_year() {
+        let d = NaiveDate::from_ymd_opt(2027, 1, 3).unwrap();
+        assert_eq!(format_relative_date(d, today()), "Sun, 3 Jan 2027");
+    }
+
+    // ── Selection / grouping logic ────────────────────────────────────────────
+
+    #[test]
+    fn next_per_type_picks_earliest_future_date_per_label_and_sorts() {
+        let pickups = vec![
+            pickup(10, "Paper"),
+            pickup(-1, "Residual"), // past — must be excluded
+            pickup(1, "Organic"),
+            pickup(3, "Paper"), // later than the 10-day one is irrelevant; earlier wins
+            pickup(6, "Recycling"),
+        ];
+        let result = next_pickup_per_type(&pickups, today());
+        let labels: Vec<&str> = result.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, vec!["Organic", "Paper", "Recycling"]);
+        assert_eq!(result[1].date, today() + chrono::Duration::days(3));
+    }
+
+    #[test]
+    fn next_per_type_excludes_labels_with_no_future_date() {
+        let pickups = vec![pickup(-3, "Residual"), pickup(2, "Paper")];
+        let result = next_pickup_per_type(&pickups, today());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].label, "Paper");
+    }
+
+    #[test]
+    fn next_per_type_today_counts_as_upcoming() {
+        let pickups = vec![pickup(0, "Organic")];
+        let result = next_pickup_per_type(&pickups, today());
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn next_event_groups_same_day_multi_type() {
+        let pickups = vec![pickup(2, "Organic"), pickup(2, "Paper"), pickup(5, "Residual")];
+        let result = next_event(&pickups, today());
+        let labels: Vec<&str> = result.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, vec!["Organic", "Paper"]);
+    }
+
+    #[test]
+    fn next_event_empty_when_nothing_upcoming() {
+        let pickups = vec![pickup(-2, "Organic")];
+        assert!(next_event(&pickups, today()).is_empty());
+    }
+
+    #[test]
+    fn week_includes_today_through_day_six_only() {
+        let pickups = vec![pickup(0, "A"), pickup(6, "B"), pickup(7, "C"), pickup(-1, "D")];
+        let result = pickups_this_week(&pickups, today());
+        let labels: Vec<&str> = result.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn dedup_removes_identical_date_label_pairs() {
+        let pickups = vec![pickup(2, "Paper"), pickup(2, "Paper"), pickup(2, "Organic")];
+        let result = dedup_pickups(pickups);
+        assert_eq!(result.len(), 2);
+    }
+
+    // ── Empty states ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_pickups_produce_empty_state_message() {
+        let (plain, html) = render_garbage_list("Next collections", &[], today(), &colors());
+        assert_eq!(plain, "🗑️ No upcoming collections found.");
+        assert_eq!(html, "🗑️ No upcoming collections found.");
+    }
+
+    #[test]
+    fn no_config_at_all_yields_empty_state_via_build_reply() {
+        let (plain, _) = build_garbage_reply(GarbageCommand::NextPerType, &[], today(), &colors());
+        assert_eq!(plain, "🗑️ No upcoming collections found.");
+    }
+
+    // ── Compact Matrix output ─────────────────────────────────────────────────
+
+    #[test]
+    fn render_is_compact_one_line_per_entry_no_table() {
+        let pickups = vec![pickup(1, "Organic"), pickup(4, "Paper"), pickup(7, "Residual")];
+        let (plain, html) = render_garbage_list("Next collections", &pickups, today(), &colors());
+
+        assert!(plain.starts_with("🗑️ Next collections\n\n"));
+        assert_eq!(plain.lines().count(), 5); // header + blank + 3 entries
+        assert!(!plain.contains('|')); // no table-like formatting
+        assert!(plain.contains("🟤 Organic · tomorrow"));
+        assert!(plain.contains("🔵 Paper · in 4 days"));
+        assert!(plain.contains("⚫ Residual · Mon, 27 Jul"));
+
+        assert!(!html.contains("<table"));
+        assert!(html.contains("<b>Next collections</b>"));
+        assert!(html.matches("<br>").count() >= 4); // header break + between 3 entries
+    }
+
+    #[test]
+    fn unknown_waste_color_falls_back_to_generic_trash_emoji() {
+        let pickups = vec![pickup(1, "Mystery")];
+        let (plain, _) = render_garbage_list("Next collections", &pickups, today(), &colors());
+        assert!(plain.contains("🗑️ Mystery · tomorrow"));
+    }
+
+    #[test]
+    fn html_escapes_label_content() {
+        let pickups = vec![pickup(1, "A & <B>")];
+        let (_, html) = render_garbage_list("Next collections", &pickups, today(), &colors());
+        assert!(html.contains("A &amp; &lt;B&gt;"));
+        assert!(!html.contains("<B>"));
+    }
+
+    #[test]
+    fn help_message_is_short_and_lists_all_subcommands() {
+        let (plain, _) = garbage_help_message();
+        assert!(plain.contains("!garbage"));
+        assert!(plain.contains("next"));
+        assert!(plain.contains("week"));
+        assert!(plain.len() < 200);
     }
 }
 
