@@ -337,8 +337,8 @@ fn build_reminder(pickups: &[Pickup], pickup_date: NaiveDate, colors: &HashMap<S
     }).collect();
     let html_bins: String = pickups.iter().map(|p| {
         match colors.get(&p.label) {
-            Some(color) => format!("<li>🗑️ <font data-mx-color=\"{color}\"><strong>{}</strong></font></li>", p.label),
-            None        => format!("<li>🗑️ <strong>{}</strong></li>", p.label),
+            Some(color) => format!("🗑️ <font data-mx-color=\"{color}\"><strong>{}</strong></font><br>", p.label),
+            None        => format!("🗑️ <strong>{}</strong><br>", p.label),
         }
     }).collect();
 
@@ -346,7 +346,7 @@ fn build_reminder(pickups: &[Pickup], pickup_date: NaiveDate, colors: &HashMap<S
         "@room\n🗑️ Tomorrow ({day}):\n{plain_bins}Put them out tonight · click ✅ when done"
     );
     let html = format!(
-        "@room<br>🗑️ Tomorrow <b>{day}</b>:<ul>{html_bins}</ul>Put them out tonight · click ✅ when done"
+        "@room<br>🗑️ Tomorrow <b>{day}</b>:<br>{html_bins}Put them out tonight · click ✅ when done"
     );
     (plain, html)
 }
