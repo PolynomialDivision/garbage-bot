@@ -602,17 +602,14 @@ fn pickups_this_week(pickups: &[Pickup], today: NaiveDate) -> Vec<Pickup> {
     entries
 }
 
-/// Compact relative date for mobile display: `today` / `tomorrow` / `in N days`
-/// for the coming week, otherwise a short localized date (`Fri, 24 Jul`),
-/// with the year appended only when it differs from the current year.
+/// Compact date for mobile display, always including the weekday for easy
+/// reading (`Fri, 24 Jul`), with the year appended only when it differs
+/// from the current year.
 fn format_relative_date(date: NaiveDate, today: NaiveDate) -> String {
-    let days = (date - today).num_days();
-    match days {
-        0 => "today".to_owned(),
-        1 => "tomorrow".to_owned(),
-        2..=6 => format!("in {days} days"),
-        _ if date.year() == today.year() => date.format("%a, %-d %b").to_string(),
-        _ => date.format("%a, %-d %b %Y").to_string(),
+    if date.year() == today.year() {
+        date.format("%a, %-d %b").to_string()
+    } else {
+        date.format("%a, %-d %b %Y").to_string()
     }
 }
 
@@ -1079,11 +1076,10 @@ mod tests {
     // ── Relative date formatting ──────────────────────────────────────────────
 
     #[test]
-    fn relative_date_near_term() {
-        assert_eq!(format_relative_date(today(), today()), "today");
-        assert_eq!(format_relative_date(today() + chrono::Duration::days(1), today()), "tomorrow");
-        assert_eq!(format_relative_date(today() + chrono::Duration::days(2), today()), "in 2 days");
-        assert_eq!(format_relative_date(today() + chrono::Duration::days(6), today()), "in 6 days");
+    fn relative_date_always_shows_weekday_and_date() {
+        assert_eq!(format_relative_date(today(), today()), "Mon, 20 Jul");
+        assert_eq!(format_relative_date(today() + chrono::Duration::days(1), today()), "Tue, 21 Jul");
+        assert_eq!(format_relative_date(today() + chrono::Duration::days(6), today()), "Sun, 26 Jul");
     }
 
     #[test]
@@ -1185,8 +1181,8 @@ mod tests {
         assert!(plain.starts_with("🗑️ Next collections\n\n"));
         assert_eq!(plain.lines().count(), 5); // header + blank + 3 entries
         assert!(!plain.contains('|')); // no table-like formatting
-        assert!(plain.contains("🟤 Organic · tomorrow"));
-        assert!(plain.contains("🔵 Paper · in 4 days"));
+        assert!(plain.contains("🟤 Organic · Tue, 21 Jul"));
+        assert!(plain.contains("🔵 Paper · Fri, 24 Jul"));
         assert!(plain.contains("⚫ Residual · Mon, 27 Jul"));
 
         assert!(!html.contains("<table"));
@@ -1198,7 +1194,7 @@ mod tests {
     fn unknown_waste_color_falls_back_to_generic_trash_emoji() {
         let pickups = vec![pickup(1, "Mystery")];
         let (plain, _) = render_garbage_list("Next collections", &pickups, today(), &colors());
-        assert!(plain.contains("🗑️ Mystery · tomorrow"));
+        assert!(plain.contains("🗑️ Mystery · Tue, 21 Jul"));
     }
 
     #[test]
