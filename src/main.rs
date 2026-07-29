@@ -287,6 +287,13 @@ struct BotState {
     http: reqwest::Client,
     // reminder event_id -> set of display names that confirmed
     confirmed: Arc<Mutex<HashMap<OwnedEventId, HashSet<String>>>>,
+    // Last-known upcoming Berlin Recycling pickups. The portal removes an
+    // imminent pickup from its calendar a day or two before it happens
+    // (presumably once the collection route is finalized), so a same-day
+    // fetch can silently lose it. We keep every future date we've ever
+    // seen and merge it back in, so a pickup we already confirmed once
+    // doesn't disappear just because the source stopped listing it.
+    br_cache: Arc<Mutex<Vec<Pickup>>>,
 }
 
 // ── Message formatting ────────────────────────────────────────────────────────
@@ -359,21 +366,53 @@ const DONE_REACTIONS: &[&str] = &["✅", "✔", "☑"];
 
 // ── Core logic ────────────────────────────────────────────────────────────────
 
+/// Merge freshly-fetched Berlin Recycling pickups with the cache of
+/// previously-seen upcoming ones. Past entries (before `today`) are dropped
+/// from the cache so it doesn't grow forever; everything else survives even
+/// if `fetched` no longer contains it.
+fn merge_berlin_recycling(cache: &[Pickup], fetched: &[Pickup], today: NaiveDate) -> Vec<Pickup> {
+    let mut seen: HashSet<(NaiveDate, String)> = HashSet::new();
+    let mut merged: Vec<Pickup> = cache
+        .iter()
+        .chain(fetched.iter())
+        .filter(|p| p.date >= today)
+        .filter(|p| seen.insert((p.date, p.label.clone())))
+        .cloned()
+        .collect();
+    merged.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.label.cmp(&b.label)));
+    merged
+}
+
 /// Fetch and merge pickups from all configured sources, sorted by date.
 /// A BSR failure is fatal (it's the primary source); a Berlin Recycling
 /// failure is logged and skipped so the reminder still fires with BSR data.
+///
+/// The Berlin Recycling portal drops an imminent pickup from its calendar
+/// response a day or two before it happens (seemingly once the collection
+/// route is finalized), so a same-day fetch can silently lose it. We merge
+/// each fetch into `state.br_cache` and keep reporting a date we've already
+/// seen until it's in the past, even if a later fetch no longer lists it.
 async fn fetch_all_pickups(state: &BotState) -> Result<Vec<Pickup>> {
     let mut pickups = fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await?;
+    let today = Local::now().date_naive();
 
     if let Some((ref user, ref pass)) = state.berlin_recycling_creds {
+        let mut cache = state.br_cache.lock().await;
         match fetch_berlin_recycling_pickups(user, pass, &state.waste_labels).await {
             Ok(br_pickups) => {
                 info!("Berlin Recycling: {} pickup(s) fetched", br_pickups.len());
-                pickups.extend(br_pickups);
-                pickups.sort_by_key(|p| p.date);
+                *cache = merge_berlin_recycling(&cache, &br_pickups, today);
             }
-            Err(e) => error!("Failed to fetch Berlin Recycling data: {e}"),
+            Err(e) => {
+                error!("Failed to fetch Berlin Recycling data: {e}");
+                *cache = merge_berlin_recycling(&cache, &[], today);
+                if !cache.is_empty() {
+                    warn!("Berlin Recycling: falling back to {} cached pickup(s)", cache.len());
+                }
+            }
         }
+        pickups.extend(cache.iter().cloned());
+        pickups.sort_by_key(|p| p.date);
     }
 
     Ok(pickups)
@@ -754,6 +793,7 @@ async fn main() -> Result<()> {
         reminder_minute,
         http: reqwest::Client::new(),
         confirmed: Arc::new(Mutex::new(HashMap::new())),
+        br_cache: Arc::new(Mutex::new(Vec::new())),
     };
 
     // Auto-join invited rooms (only from allowed_inviters)
@@ -1176,6 +1216,70 @@ mod tests {
         assert!(plain.contains("next"));
         assert!(plain.contains("week"));
         assert!(plain.len() < 200);
+    }
+
+    // ── Berlin Recycling cache ────────────────────────────────────────────────
+    // Regression coverage for the portal dropping an imminent pickup from its
+    // calendar response a day or two before it happens: a date we've already
+    // seen once must keep showing up even if a later fetch no longer lists it.
+
+    #[test]
+    fn merge_with_empty_cache_returns_fetched_future_dates() {
+        let fetched = vec![pickup(1, "Paper"), pickup(8, "Paper")];
+        let merged = merge_berlin_recycling(&[], &fetched, today());
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_keeps_a_cached_date_the_source_stopped_listing() {
+        // Yesterday's fetch saw tomorrow's pickup; today's fetch — because
+        // the portal already dropped it — no longer includes it.
+        let cache = vec![pickup(1, "Paper"), pickup(8, "Paper")];
+        let fetched = vec![pickup(8, "Paper")]; // tomorrow's entry vanished from the source
+        let merged = merge_berlin_recycling(&cache, &fetched, today());
+
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|p| p.date == today() + chrono::Duration::days(1)));
+    }
+
+    #[test]
+    fn merge_drops_past_cached_entries_instead_of_resurrecting_them() {
+        let cache = vec![pickup(-7, "Paper"), pickup(1, "Paper")];
+        let merged = merge_berlin_recycling(&cache, &[], today());
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].date, today() + chrono::Duration::days(1));
+    }
+
+    #[test]
+    fn merge_deduplicates_a_date_present_in_both_cache_and_fetch() {
+        let cache = vec![pickup(1, "Paper")];
+        let fetched = vec![pickup(1, "Paper")];
+        let merged = merge_berlin_recycling(&cache, &fetched, today());
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn merge_on_failed_fetch_falls_back_to_cache() {
+        // fetch_all_pickups passes an empty slice on a failed Berlin Recycling
+        // fetch; previously-cached upcoming dates must still come through.
+        let cache = vec![pickup(1, "Paper"), pickup(8, "Paper")];
+        let merged = merge_berlin_recycling(&cache, &[], today());
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_result_is_sorted_by_date_then_label() {
+        let cache = vec![pickup(8, "Residual"), pickup(1, "Paper")];
+        let fetched = vec![pickup(1, "Organic")];
+        let merged = merge_berlin_recycling(&cache, &fetched, today());
+
+        let dates: Vec<_> = merged.iter().map(|p| (p.date, p.label.as_str())).collect();
+        assert_eq!(dates, vec![
+            (today() + chrono::Duration::days(1), "Organic"),
+            (today() + chrono::Duration::days(1), "Paper"),
+            (today() + chrono::Duration::days(8), "Residual"),
+        ]);
     }
 }
 
