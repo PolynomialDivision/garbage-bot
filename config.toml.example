@@ -65,3 +65,12 @@ WB = "Christmas Tree"
 "Garden Waste (green)"   = "#556B2F"
 "Christmas Tree"         = "#006400"
 "Paper (blue)"           = "#4682B4"
+
+[security.verification]
+# Users allowed to complete first-time verification. If omitted or empty,
+# an explicit allowed_inviters list is used as the fallback.
+allowed_users = ["@you:matrix.org"]
+# SAS-only verification limits.
+flow_timeout_secs = 300
+grant_ttl_secs = 600
+max_concurrent = 8

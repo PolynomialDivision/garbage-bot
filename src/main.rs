@@ -8,28 +8,28 @@ use std::{
 use anyhow::{anyhow, Result};
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use matrix_sdk::{
-    Client, Room, RoomState,
     config::SyncSettings,
     ruma::{
-        OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
         api::client::filter::FilterDefinition,
         events::{
-            Mentions,
-            key::verification::request::ToDeviceKeyVerificationRequestEvent,
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
             relation::Annotation,
             room::{
                 member::StrippedRoomMemberEvent,
                 message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
             },
+            Mentions,
         },
+        OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
     },
+    Client, Room, RoomState,
 };
 use mxbot_common::config::{MatrixConfig, SecurityConfig};
+use mxbot_common::verify::VerificationService;
 use serde::Deserialize;
-use url::Url;
 use tokio::{fs, sync::Mutex, time::sleep};
 use tracing::{error, info, warn};
+use url::Url;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -75,18 +75,17 @@ fn default_reminder_time() -> String {
 
 impl Default for ReminderConfig {
     fn default() -> Self {
-        Self { reminder_time: default_reminder_time() }
+        Self {
+            reminder_time: default_reminder_time(),
+        }
     }
 }
 
 // ── BSR API ───────────────────────────────────────────────────────────────────
 
-const BSR_PICKUPS: &str =
-    "https://umnewforms.bsr.de/p/de.bsr.adressen.app/abfuhrEvents";
-const BSR_STREETS: &str =
-    "https://umnewforms.bsr.de/p/de.bsr.adressen.app/streetNames";
-const BSR_SCHEDID: &str =
-    "https://umnewforms.bsr.de/p/de.bsr.adressen.app/plzSet/plzSet";
+const BSR_PICKUPS: &str = "https://umnewforms.bsr.de/p/de.bsr.adressen.app/abfuhrEvents";
+const BSR_STREETS: &str = "https://umnewforms.bsr.de/p/de.bsr.adressen.app/streetNames";
+const BSR_SCHEDID: &str = "https://umnewforms.bsr.de/p/de.bsr.adressen.app/plzSet/plzSet";
 
 #[derive(Debug, Clone)]
 struct Pickup {
@@ -118,7 +117,12 @@ struct BsrPickupEntry {
     category: String,
 }
 
-async fn resolve_schedule_id(http: &reqwest::Client, street: &str, number: &str, plz: Option<&str>) -> Result<String> {
+async fn resolve_schedule_id(
+    http: &reqwest::Client,
+    street: &str,
+    number: &str,
+    plz: Option<&str>,
+) -> Result<String> {
     let url = Url::parse_with_params(BSR_STREETS, &[("searchQuery", street)])?;
     let streets: Vec<BsrStreetEntry> = http.get(url).send().await?.json().await?;
 
@@ -130,18 +134,28 @@ async fn resolve_schedule_id(http: &reqwest::Client, street: &str, number: &str,
         .find(|s| s.value.to_lowercase() == street.to_lowercase())
         .unwrap_or(&streets[0]);
 
-    let url = Url::parse_with_params(BSR_SCHEDID, &[("searchQuery", format!("{}:::{}", matched.value, number))])?;
+    let url = Url::parse_with_params(
+        BSR_SCHEDID,
+        &[("searchQuery", format!("{}:::{}", matched.value, number))],
+    )?;
     let results: Vec<BsrScheduleEntry> = http.get(url).send().await?.json().await?;
 
     if results.is_empty() {
-        return Err(anyhow!("No BSR address found for: {} {}", matched.value, number));
+        return Err(anyhow!(
+            "No BSR address found for: {} {}",
+            matched.value,
+            number
+        ));
     }
     if results.len() == 1 {
         return Ok(results[0].value.clone());
     }
 
     // Multiple results — log them all so the user can identify the right one.
-    info!("Multiple BSR addresses found for {} {}:", matched.value, number);
+    info!(
+        "Multiple BSR addresses found for {} {}:",
+        matched.value, number
+    );
     for (i, e) in results.iter().enumerate() {
         info!("  [{i}] {} (id: {})", e.label, e.value);
     }
@@ -195,17 +209,20 @@ async fn fetch_pickups(
 
 const BR_PORTAL: &str = "https://kundenportal.berlin-recycling.de/";
 
-async fn fetch_berlin_recycling_pickups(username: &str, password: &str, waste_labels: &HashMap<String, String>) -> Result<Vec<Pickup>> {
+async fn fetch_berlin_recycling_pickups(
+    username: &str,
+    password: &str,
+    waste_labels: &HashMap<String, String>,
+) -> Result<Vec<Pickup>> {
     // Each call creates a fresh session — the portal is stateful via cookies.
-    let http = reqwest::Client::builder()
-        .cookie_store(true)
-        .build()?;
+    let http = reqwest::Client::builder().cookie_store(true).build()?;
 
     // Establish session
     http.get(BR_PORTAL).send().await?;
 
     // Login
-    let resp = http.post(format!("{BR_PORTAL}Login.aspx/Auth"))
+    let resp = http
+        .post(format!("{BR_PORTAL}Login.aspx/Auth"))
         .json(&serde_json::json!({
             "username": username,
             "password": password,
@@ -219,7 +236,10 @@ async fn fetch_berlin_recycling_pickups(username: &str, password: &str, waste_la
     // Verify login didn't redirect away
     let check = http.get(format!("{BR_PORTAL}Default.aspx")).send().await?;
     if check.url().host_str() != Some("kundenportal.berlin-recycling.de") {
-        return Err(anyhow!("Berlin Recycling login failed — redirected to {}", check.url()));
+        return Err(anyhow!(
+            "Berlin Recycling login failed — redirected to {}",
+            check.url()
+        ));
     }
 
     // Required portal handshake
@@ -229,7 +249,8 @@ async fn fetch_berlin_recycling_pickups(username: &str, password: &str, waste_la
         .await?;
 
     // Fetch the collection calendar
-    let resp = http.post(format!("{BR_PORTAL}Default.aspx/GetDatasetTableHead"))
+    let resp = http
+        .post(format!("{BR_PORTAL}Default.aspx/GetDatasetTableHead"))
         .json(&serde_json::json!({
             "datasettablecode": "ABFUHRKALENDER",
             "startindex": 0,
@@ -245,23 +266,34 @@ async fn fetch_berlin_recycling_pickups(username: &str, password: &str, waste_la
 
     // Response is double-encoded: outer JSON has a "d" key containing a JSON string.
     let outer: serde_json::Value = resp.json().await?;
-    let inner_str = outer["d"].as_str()
+    let inner_str = outer["d"]
+        .as_str()
         .ok_or_else(|| anyhow!("Berlin Recycling: unexpected response shape (missing 'd')"))?;
     let inner: serde_json::Value = serde_json::from_str(inner_str)?;
 
-    let data = inner["Object"]["data"].as_array()
+    let data = inner["Object"]["data"]
+        .as_array()
         .ok_or_else(|| anyhow!("Berlin Recycling: no data array in response"))?;
 
-    let mut pickups: Vec<Pickup> = data.iter()
+    let mut pickups: Vec<Pickup> = data
+        .iter()
         .filter_map(|d| {
             let date = NaiveDate::parse_from_str(d["Task Date"].as_str()?, "%Y-%m-%d").ok()?;
             let raw = d["Material Description"].as_str()?;
             // Strip leading category code like "5.01 " from the material description.
             let stripped = match raw.split_once(' ') {
-                Some((code, rest)) if code.contains('.') && code.chars().all(|c| c.is_ascii_digit() || c == '.') => rest,
+                Some((code, rest))
+                    if code.contains('.')
+                        && code.chars().all(|c| c.is_ascii_digit() || c == '.') =>
+                {
+                    rest
+                }
                 _ => raw,
             };
-            let label = waste_labels.get(stripped).cloned().unwrap_or_else(|| stripped.to_owned());
+            let label = waste_labels
+                .get(stripped)
+                .cloned()
+                .unwrap_or_else(|| stripped.to_owned());
             Some(Pickup { date, label })
         })
         .collect();
@@ -277,7 +309,7 @@ struct BotState {
     bot_user_id: OwnedUserId,
     admin_users: HashSet<OwnedUserId>,
     allowed_inviters: HashSet<OwnedUserId>,
-    reset_allowed: Arc<Mutex<HashSet<OwnedUserId>>>,
+    verification: VerificationService,
     bsr_schedule_id: String,
     berlin_recycling_creds: Option<(String, String)>,
     waste_labels: HashMap<String, String>,
@@ -304,20 +336,28 @@ fn hex_to_dot(hex: &str) -> &'static str {
     let Ok(n) = u32::from_str_radix(&s[..s.len().min(6)], 16) else {
         return "🗑️";
     };
-    if s.len() < 6 { return "🗑️"; }
+    if s.len() < 6 {
+        return "🗑️";
+    }
     let r = ((n >> 16) & 0xff) as f32;
-    let g = ((n >>  8) & 0xff) as f32;
-    let b = ( n        & 0xff) as f32;
+    let g = ((n >> 8) & 0xff) as f32;
+    let b = (n & 0xff) as f32;
 
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let chroma = max - min;
 
-    if chroma < 40.0 { return "⚫"; }
+    if chroma < 40.0 {
+        return "⚫";
+    }
 
     let hue = if max == r {
         let h = 60.0 * (g - b) / chroma;
-        if h < 0.0 { h + 360.0 } else { h }
+        if h < 0.0 {
+            h + 360.0
+        } else {
+            h
+        }
     } else if max == g {
         60.0 * ((b - r) / chroma + 2.0)
     } else {
@@ -326,28 +366,39 @@ fn hex_to_dot(hex: &str) -> &'static str {
 
     // Brown is dark orange (hue ~15–40°, low brightness).
     match hue as u32 {
-        330..=360 | 0..=14              => "🔴",
-        15..=40 if max < 180.0          => "🟤",
-        15..=75                         => "🟡",
-        76..=165                        => "🟢",
-        166..=255                       => "🔵",
-        _                               => "🟣",
+        330..=360 | 0..=14 => "🔴",
+        15..=40 if max < 180.0 => "🟤",
+        15..=75 => "🟡",
+        76..=165 => "🟢",
+        166..=255 => "🔵",
+        _ => "🟣",
     }
 }
 
-fn build_reminder(pickups: &[Pickup], pickup_date: NaiveDate, colors: &HashMap<String, String>) -> (String, String) {
+fn build_reminder(
+    pickups: &[Pickup],
+    pickup_date: NaiveDate,
+    colors: &HashMap<String, String>,
+) -> (String, String) {
     let day = pickup_date.format("%A, %d.%m.%Y").to_string();
 
-    let plain_bins: String = pickups.iter().map(|p| {
-        let dot = colors.get(&p.label).map(|c| hex_to_dot(c)).unwrap_or("🗑️");
-        format!("{dot} {}\n", p.label)
-    }).collect();
-    let html_bins: String = pickups.iter().map(|p| {
-        match colors.get(&p.label) {
-            Some(color) => format!("🗑️ <font data-mx-color=\"{color}\"><strong>{}</strong></font><br>", p.label),
-            None        => format!("🗑️ <strong>{}</strong><br>", p.label),
-        }
-    }).collect();
+    let plain_bins: String = pickups
+        .iter()
+        .map(|p| {
+            let dot = colors.get(&p.label).map(|c| hex_to_dot(c)).unwrap_or("🗑️");
+            format!("{dot} {}\n", p.label)
+        })
+        .collect();
+    let html_bins: String = pickups
+        .iter()
+        .map(|p| match colors.get(&p.label) {
+            Some(color) => format!(
+                "🗑️ <font data-mx-color=\"{color}\"><strong>{}</strong></font><br>",
+                p.label
+            ),
+            None => format!("🗑️ <strong>{}</strong><br>", p.label),
+        })
+        .collect();
 
     let plain = format!(
         "@room\n🗑️ Tomorrow ({day}):\n{plain_bins}Put them out tonight · click ✅ when done"
@@ -359,7 +410,9 @@ fn build_reminder(pickups: &[Pickup], pickup_date: NaiveDate, colors: &HashMap<S
 }
 
 fn strip_variation_selectors(s: &str) -> String {
-    s.chars().filter(|&c| !('\u{FE00}'..='\u{FE0F}').contains(&c)).collect()
+    s.chars()
+        .filter(|&c| !('\u{FE00}'..='\u{FE0F}').contains(&c))
+        .collect()
 }
 
 const DONE_REACTIONS: &[&str] = &["✅", "✔", "☑"];
@@ -393,7 +446,8 @@ fn merge_berlin_recycling(cache: &[Pickup], fetched: &[Pickup], today: NaiveDate
 /// each fetch into `state.br_cache` and keep reporting a date we've already
 /// seen until it's in the past, even if a later fetch no longer lists it.
 async fn fetch_all_pickups(state: &BotState) -> Result<Vec<Pickup>> {
-    let mut pickups = fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await?;
+    let mut pickups =
+        fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await?;
     let today = Local::now().date_naive();
 
     if let Some((ref user, ref pass)) = state.berlin_recycling_creds {
@@ -407,7 +461,10 @@ async fn fetch_all_pickups(state: &BotState) -> Result<Vec<Pickup>> {
                 error!("Failed to fetch Berlin Recycling data: {e}");
                 *cache = merge_berlin_recycling(&cache, &[], today);
                 if !cache.is_empty() {
-                    warn!("Berlin Recycling: falling back to {} cached pickup(s)", cache.len());
+                    warn!(
+                        "Berlin Recycling: falling back to {} cached pickup(s)",
+                        cache.len()
+                    );
                 }
             }
         }
@@ -437,11 +494,19 @@ async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
             return;
         }
         let next_date = future[0].date;
-        let on_day: Vec<Pickup> = pickups.iter().filter(|p| p.date == next_date).cloned().collect();
+        let on_day: Vec<Pickup> = pickups
+            .iter()
+            .filter(|p| p.date == next_date)
+            .cloned()
+            .collect();
         info!("Test mode: using pickup date {next_date}");
         (next_date, on_day)
     } else {
-        let on_day: Vec<Pickup> = pickups.iter().filter(|p| p.date == tomorrow).cloned().collect();
+        let on_day: Vec<Pickup> = pickups
+            .iter()
+            .filter(|p| p.date == tomorrow)
+            .cloned()
+            .collect();
         (tomorrow, on_day)
     };
 
@@ -475,11 +540,14 @@ async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
             Ok(resp) => {
                 let event_id = resp.response.event_id;
                 info!("Sent reminder to {}, event_id={}", room.room_id(), event_id);
-                state.confirmed.lock().await.insert(event_id.clone(), HashSet::new());
+                state
+                    .confirmed
+                    .lock()
+                    .await
+                    .insert(event_id.clone(), HashSet::new());
                 // React with ✅ so users see a button they can click immediately.
-                let reaction = ReactionEventContent::new(
-                    Annotation::new(event_id, "✅".to_owned()),
-                );
+                let reaction =
+                    ReactionEventContent::new(Annotation::new(event_id, "✅".to_owned()));
                 if let Err(e) = room.send(reaction).await {
                     warn!("Failed to react to reminder: {e}");
                 }
@@ -582,10 +650,19 @@ fn next_pickup_per_type(pickups: &[Pickup], today: NaiveDate) -> Vec<Pickup> {
 
 /// All waste types collected on the single nearest upcoming date.
 fn next_event(pickups: &[Pickup], today: NaiveDate) -> Vec<Pickup> {
-    let Some(next_date) = pickups.iter().filter(|p| p.date >= today).map(|p| p.date).min() else {
+    let Some(next_date) = pickups
+        .iter()
+        .filter(|p| p.date >= today)
+        .map(|p| p.date)
+        .min()
+    else {
         return Vec::new();
     };
-    let mut entries: Vec<Pickup> = pickups.iter().filter(|p| p.date == next_date).cloned().collect();
+    let mut entries: Vec<Pickup> = pickups
+        .iter()
+        .filter(|p| p.date == next_date)
+        .cloned()
+        .collect();
     entries.sort_by(|a, b| a.label.cmp(&b.label));
     entries
 }
@@ -664,11 +741,31 @@ fn render_garbage_list(
     (plain, html)
 }
 
-fn build_garbage_reply(cmd: GarbageCommand, pickups: &[Pickup], today: NaiveDate, colors: &HashMap<String, String>) -> (String, String) {
+fn build_garbage_reply(
+    cmd: GarbageCommand,
+    pickups: &[Pickup],
+    today: NaiveDate,
+    colors: &HashMap<String, String>,
+) -> (String, String) {
     match cmd {
-        GarbageCommand::NextPerType => render_garbage_list("Next collections", &next_pickup_per_type(pickups, today), today, colors),
-        GarbageCommand::NextEvent => render_garbage_list("Next collection", &next_event(pickups, today), today, colors),
-        GarbageCommand::Week => render_garbage_list("Next 7 days", &pickups_this_week(pickups, today), today, colors),
+        GarbageCommand::NextPerType => render_garbage_list(
+            "Next collections",
+            &next_pickup_per_type(pickups, today),
+            today,
+            colors,
+        ),
+        GarbageCommand::NextEvent => render_garbage_list(
+            "Next collection",
+            &next_event(pickups, today),
+            today,
+            colors,
+        ),
+        GarbageCommand::Week => render_garbage_list(
+            "Next 7 days",
+            &pickups_this_week(pickups, today),
+            today,
+            colors,
+        ),
         GarbageCommand::Help => garbage_help_message(),
     }
 }
@@ -690,7 +787,10 @@ async fn handle_garbage_command(state: BotState, room: Room, cmd: GarbageCommand
         }
     };
 
-    if let Err(e) = room.send(RoomMessageEventContent::text_html(plain, html)).await {
+    if let Err(e) = room
+        .send(RoomMessageEventContent::text_html(plain, html))
+        .await
+    {
         error!("Failed to send !garbage reply: {e}");
     }
 }
@@ -710,22 +810,29 @@ async fn main() -> Result<()> {
     let mut config: Config = toml::from_str(&config_str)?;
 
     // Resolve BSR schedule_id if only street/number given
-    let schedule_id = match config.bsr.schedule_id.take() {
-        Some(id) => id,
-        None => {
-            let street = config.bsr.street.as_deref()
-                .ok_or_else(|| anyhow!("Config: set [bsr] schedule_id OR street + number"))?;
-            let number = config.bsr.number.as_deref()
-                .ok_or_else(|| anyhow!("Config: set [bsr] schedule_id OR street + number"))?;
-            let plz = config.bsr.plz.as_deref();
-            info!("Resolving BSR schedule_id for {street} {number}{}...",
-                plz.map(|p| format!(", PLZ {p}")).unwrap_or_default());
-            let http = reqwest::Client::new();
-            let id = resolve_schedule_id(&http, street, number, plz).await?;
-            info!("Resolved schedule_id: {id}");
-            id
-        }
-    };
+    let schedule_id =
+        match config.bsr.schedule_id.take() {
+            Some(id) => id,
+            None => {
+                let street =
+                    config.bsr.street.as_deref().ok_or_else(|| {
+                        anyhow!("Config: set [bsr] schedule_id OR street + number")
+                    })?;
+                let number =
+                    config.bsr.number.as_deref().ok_or_else(|| {
+                        anyhow!("Config: set [bsr] schedule_id OR street + number")
+                    })?;
+                let plz = config.bsr.plz.as_deref();
+                info!(
+                    "Resolving BSR schedule_id for {street} {number}{}...",
+                    plz.map(|p| format!(", PLZ {p}")).unwrap_or_default()
+                );
+                let http = reqwest::Client::new();
+                let id = resolve_schedule_id(&http, street, number, plz).await?;
+                info!("Resolved schedule_id: {id}");
+                id
+            }
+        };
 
     let reminder_time = config.reminder.reminder_time.clone();
     let (reminder_hour, reminder_minute) = {
@@ -736,14 +843,14 @@ async fn main() -> Result<()> {
         (parts[0].parse::<u32>()?, parts[1].parse::<u32>()?)
     };
 
-    let store_path = PathBuf::from(
-        std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()),
-    );
+    let store_path =
+        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
     let (client, user_id) = mxbot_common::session::build_and_restore(
         &config.matrix,
         &store_path,
         config.security.encryption_strategy.into(),
-    ).await?;
+    )
+    .await?;
 
     let admin_users: HashSet<OwnedUserId> = config
         .security
@@ -759,6 +866,13 @@ async fn main() -> Result<()> {
         .filter_map(|s| s.parse().ok())
         .collect();
 
+    let verification = VerificationService::allowlisted_tofu_from_config(
+        client.clone(),
+        &config.security.verification,
+        &config.security.allowed_inviters,
+    );
+    verification.install_handlers();
+
     if admin_users.is_empty() {
         warn!("No admin_users configured — !reset-trust command is disabled");
     } else {
@@ -771,8 +885,7 @@ async fn main() -> Result<()> {
         info!("Allowed inviters: {allowed_inviters:?}");
     }
 
-    let berlin_recycling_creds = config.berlin_recycling
-        .map(|br| (br.username, br.password));
+    let berlin_recycling_creds = config.berlin_recycling.map(|br| (br.username, br.password));
     if berlin_recycling_creds.is_some() {
         info!("Berlin Recycling credentials configured — paper pickups enabled");
     }
@@ -781,7 +894,7 @@ async fn main() -> Result<()> {
         bot_user_id: user_id,
         admin_users,
         allowed_inviters,
-        reset_allowed: Arc::new(Mutex::new(HashSet::new())),
+        verification,
         bsr_schedule_id: schedule_id,
         berlin_recycling_creds,
         waste_labels: config.waste_labels,
@@ -851,45 +964,13 @@ async fn main() -> Result<()> {
         }
     });
 
-    // To-device verification requests
+    // In-room messages: verification requests are handled by mxbot-common.
     client.add_event_handler({
         let state = state.clone();
-        move |ev: ToDeviceKeyVerificationRequestEvent, client: Client| {
-            let state = state.clone();
-            async move {
-                let Some(request) = client
-                    .encryption()
-                    .get_verification_request(&ev.sender, &ev.content.transaction_id)
-                    .await
-                else {
-                    warn!("to-device verification request object not found");
-                    return;
-                };
-                tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client, Arc::clone(&state.reset_allowed), request,
-                ));
-            }
-        }
-    });
-
-    // In-room messages: verification requests and admin commands
-    client.add_event_handler({
-        let state = state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
+        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
             let state = state.clone();
             async move {
                 if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
-                    let Some(request) = client
-                        .encryption()
-                        .get_verification_request(&ev.sender, &ev.event_id)
-                        .await
-                    else {
-                        warn!("in-room verification request object not found");
-                        return;
-                    };
-                    tokio::spawn(mxbot_common::verify::handle_verification_request(
-                    client, Arc::clone(&state.reset_allowed), request,
-                ));
                     return;
                 }
 
@@ -897,22 +978,19 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                let MessageType::Text(ref text) = ev.content.msgtype else { return };
+                let MessageType::Text(ref text) = ev.content.msgtype else {
+                    return;
+                };
                 let raw = text.body.trim();
 
-                if let Some(target) = raw.strip_prefix("!reset-trust ") {
-                    if state.admin_users.contains(&ev.sender) {
-                        match target.trim().parse::<OwnedUserId>() {
-                            Ok(target_user) => {
-                                state.reset_allowed.lock().await.insert(target_user.clone());
-                                info!("Trust reset allowed for {} (by {})", target_user, ev.sender);
-                            }
-                            Err(_) => warn!("!reset-trust: invalid user ID '{}'", target.trim()),
-                        }
-                    } else {
-                        warn!("!reset-trust from non-admin {} — ignored", ev.sender);
-                    }
-                } else if let Some(cmd) = parse_garbage_command(raw) {
+                if state
+                    .verification
+                    .handle_admin_command(&ev.sender, &state.admin_users, raw)
+                    .await
+                {
+                    return;
+                }
+                if let Some(cmd) = parse_garbage_command(raw) {
                     tokio::spawn(handle_garbage_command(state.clone(), room, cmd));
                 }
             }
@@ -945,7 +1023,10 @@ async fn main() -> Result<()> {
     // Drain pending invites from prior sessions.
     let invited = client.invited_rooms();
     if !invited.is_empty() {
-        info!("Pending invite(s) found after initial sync — joining {} room(s)", invited.len());
+        info!(
+            "Pending invite(s) found after initial sync — joining {} room(s)",
+            invited.len()
+        );
         for room in invited {
             let room_id = room.room_id().to_owned();
             let via: Vec<OwnedServerName> = room_id
@@ -965,7 +1046,10 @@ async fn main() -> Result<()> {
     }
 
     loop {
-        match client.sync(SyncSettings::default().filter(filter.clone().into())).await {
+        match client
+            .sync(SyncSettings::default().filter(filter.clone().into()))
+            .await
+        {
             Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
             Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
         }
@@ -1041,29 +1125,56 @@ mod tests {
     }
 
     fn pickup(days_from_today: i64, label: &str) -> Pickup {
-        Pickup { date: today() + chrono::Duration::days(days_from_today), label: label.to_owned() }
+        Pickup {
+            date: today() + chrono::Duration::days(days_from_today),
+            label: label.to_owned(),
+        }
     }
 
     // ── Command parsing ───────────────────────────────────────────────────────
 
     #[test]
     fn parses_bare_command_as_next_per_type() {
-        assert_eq!(parse_garbage_command("!garbage"), Some(GarbageCommand::NextPerType));
-        assert_eq!(parse_garbage_command("  !garbage  "), Some(GarbageCommand::NextPerType));
-        assert_eq!(parse_garbage_command("!garbage "), Some(GarbageCommand::NextPerType));
+        assert_eq!(
+            parse_garbage_command("!garbage"),
+            Some(GarbageCommand::NextPerType)
+        );
+        assert_eq!(
+            parse_garbage_command("  !garbage  "),
+            Some(GarbageCommand::NextPerType)
+        );
+        assert_eq!(
+            parse_garbage_command("!garbage "),
+            Some(GarbageCommand::NextPerType)
+        );
     }
 
     #[test]
     fn parses_subcommands_case_insensitively() {
-        assert_eq!(parse_garbage_command("!garbage next"), Some(GarbageCommand::NextEvent));
-        assert_eq!(parse_garbage_command("!GARBAGE NEXT"), Some(GarbageCommand::NextEvent));
-        assert_eq!(parse_garbage_command("!garbage week"), Some(GarbageCommand::Week));
-        assert_eq!(parse_garbage_command("!garbage help"), Some(GarbageCommand::Help));
+        assert_eq!(
+            parse_garbage_command("!garbage next"),
+            Some(GarbageCommand::NextEvent)
+        );
+        assert_eq!(
+            parse_garbage_command("!GARBAGE NEXT"),
+            Some(GarbageCommand::NextEvent)
+        );
+        assert_eq!(
+            parse_garbage_command("!garbage week"),
+            Some(GarbageCommand::Week)
+        );
+        assert_eq!(
+            parse_garbage_command("!garbage help"),
+            Some(GarbageCommand::Help)
+        );
     }
 
     #[test]
     fn unknown_subcommand_falls_back_to_help() {
-        assert_eq!(parse_garbage_command("!garbage bogus"), Some(GarbageCommand::Help));
+        assert_eq!(
+            parse_garbage_command("!garbage bogus"),
+            Some(GarbageCommand::Help)
+        );
     }
 
     #[test]
@@ -1078,8 +1189,14 @@ mod tests {
     #[test]
     fn relative_date_always_shows_weekday_and_date() {
         assert_eq!(format_relative_date(today(), today()), "Mon, 20 Jul");
-        assert_eq!(format_relative_date(today() + chrono::Duration::days(1), today()), "Tue, 21 Jul");
-        assert_eq!(format_relative_date(today() + chrono::Duration::days(6), today()), "Sun, 26 Jul");
+        assert_eq!(
+            format_relative_date(today() + chrono::Duration::days(1), today()),
+            "Tue, 21 Jul"
+        );
+        assert_eq!(
+            format_relative_date(today() + chrono::Duration::days(6), today()),
+            "Sun, 26 Jul"
+        );
     }
 
     #[test]
@@ -1129,7 +1246,11 @@ mod tests {
 
     #[test]
     fn next_event_groups_same_day_multi_type() {
-        let pickups = vec![pickup(2, "Organic"), pickup(2, "Paper"), pickup(5, "Residual")];
+        let pickups = vec![
+            pickup(2, "Organic"),
+            pickup(2, "Paper"),
+            pickup(5, "Residual"),
+        ];
         let result = next_event(&pickups, today());
         let labels: Vec<&str> = result.iter().map(|p| p.label.as_str()).collect();
         assert_eq!(labels, vec!["Organic", "Paper"]);
@@ -1143,7 +1264,12 @@ mod tests {
 
     #[test]
     fn week_includes_today_through_day_six_only() {
-        let pickups = vec![pickup(0, "A"), pickup(6, "B"), pickup(7, "C"), pickup(-1, "D")];
+        let pickups = vec![
+            pickup(0, "A"),
+            pickup(6, "B"),
+            pickup(7, "C"),
+            pickup(-1, "D"),
+        ];
         let result = pickups_this_week(&pickups, today());
         let labels: Vec<&str> = result.iter().map(|p| p.label.as_str()).collect();
         assert_eq!(labels, vec!["A", "B"]);
@@ -1175,7 +1301,11 @@ mod tests {
 
     #[test]
     fn render_is_compact_one_line_per_entry_no_table() {
-        let pickups = vec![pickup(1, "Organic"), pickup(4, "Paper"), pickup(7, "Residual")];
+        let pickups = vec![
+            pickup(1, "Organic"),
+            pickup(4, "Paper"),
+            pickup(7, "Residual"),
+        ];
         let (plain, html) = render_garbage_list("Next collections", &pickups, today(), &colors());
 
         assert!(plain.starts_with("🗑️ Next collections\n\n"));
@@ -1235,7 +1365,9 @@ mod tests {
         let merged = merge_berlin_recycling(&cache, &fetched, today());
 
         assert_eq!(merged.len(), 2);
-        assert!(merged.iter().any(|p| p.date == today() + chrono::Duration::days(1)));
+        assert!(merged
+            .iter()
+            .any(|p| p.date == today() + chrono::Duration::days(1)));
     }
 
     #[test]
@@ -1271,11 +1403,13 @@ mod tests {
         let merged = merge_berlin_recycling(&cache, &fetched, today());
 
         let dates: Vec<_> = merged.iter().map(|p| (p.date, p.label.as_str())).collect();
-        assert_eq!(dates, vec![
-            (today() + chrono::Duration::days(1), "Organic"),
-            (today() + chrono::Duration::days(1), "Paper"),
-            (today() + chrono::Duration::days(8), "Residual"),
-        ]);
+        assert_eq!(
+            dates,
+            vec![
+                (today() + chrono::Duration::days(1), "Organic"),
+                (today() + chrono::Duration::days(1), "Paper"),
+                (today() + chrono::Duration::days(8), "Residual"),
+            ]
+        );
     }
 }
-
