@@ -1,12 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use anyhow::{anyhow, Result};
-use chrono::{Datelike, Local, NaiveDate, NaiveTime};
+use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveTime, TimeZone};
 use matrix_sdk::{
     config::SyncSettings,
     ruma::{
@@ -26,7 +26,7 @@ use matrix_sdk::{
 };
 use mxbot_common::config::{MatrixConfig, SecurityConfig};
 use mxbot_common::verify::VerificationService;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{fs, sync::Mutex, time::sleep};
 use tracing::{error, info, warn};
 use url::Url;
@@ -87,7 +87,7 @@ const BSR_PICKUPS: &str = "https://umnewforms.bsr.de/p/de.bsr.adressen.app/abfuh
 const BSR_STREETS: &str = "https://umnewforms.bsr.de/p/de.bsr.adressen.app/streetNames";
 const BSR_SCHEDID: &str = "https://umnewforms.bsr.de/p/de.bsr.adressen.app/plzSet/plzSet";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Pickup {
     date: NaiveDate,
     label: String,
@@ -302,6 +302,95 @@ async fn fetch_berlin_recycling_pickups(
     Ok(pickups)
 }
 
+// ── Persistent state ─────────────────────────────────────────────────────────
+//
+// Survives container restarts via a JSON file on the `store` volume (already
+// used for the Matrix session/crypto store, so it's already durable). Written
+// atomically (tmp file + rename) so a kill mid-write can't corrupt it.
+
+/// A reminder that has been decided (pickups + date) but may not yet be fully
+/// delivered to every joined room. Persisted as soon as it's created — before
+/// any send is attempted — so a crash between "decided" and "delivered" is
+/// recovered on restart instead of silently losing the reminder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingReminder {
+    date: NaiveDate,
+    pickups: Vec<Pickup>,
+    /// Room IDs (as strings) that have already received this reminder —
+    /// checked before every send attempt so retries and restarts never
+    /// duplicate a delivery.
+    #[serde(default)]
+    sent_room_ids: HashSet<String>,
+    #[serde(default)]
+    attempt: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PersistedState {
+    #[serde(default)]
+    bsr_cache: Vec<Pickup>,
+    #[serde(default)]
+    br_cache: Vec<Pickup>,
+    /// The most recent date whose "tomorrow" reminder has already been
+    /// evaluated (sent or found to have no pickups) — prevents refetching
+    /// and re-deciding every scheduler tick after the target time has passed
+    /// for the day.
+    #[serde(default)]
+    last_checked_date: Option<NaiveDate>,
+    /// The most recent date whose reminder was *fully* delivered. Distinct
+    /// from `last_checked_date` so an empty day never looks like a sent one.
+    #[serde(default)]
+    last_sent_date: Option<NaiveDate>,
+    #[serde(default)]
+    pending_reminder: Option<PendingReminder>,
+}
+
+async fn load_persisted_state(path: &Path) -> PersistedState {
+    match fs::read_to_string(path).await {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(state) => state,
+            Err(e) => {
+                error!("Reminder state file at {path:?} is corrupt ({e}) — starting fresh. Previously-cached schedules and any pending reminder are lost.");
+                PersistedState::default()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PersistedState::default(),
+        Err(e) => {
+            error!("Failed to read reminder state file at {path:?} ({e}) — starting fresh.");
+            PersistedState::default()
+        }
+    }
+}
+
+async fn save_persisted_state(path: &Path, state: &PersistedState) {
+    let json = match serde_json::to_string_pretty(state) {
+        Ok(j) => j,
+        Err(e) => {
+            error!("Failed to serialize reminder state: {e}");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = fs::write(&tmp, &json).await {
+        error!("Failed to write reminder state tmp file at {tmp:?}: {e}");
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp, path).await {
+        error!("Failed to persist reminder state to {path:?}: {e}");
+    }
+}
+
+/// Operational health of one schedule source, for `!garbage status`/`refresh`.
+/// Intentionally not persisted — it's operational telemetry, not data that
+/// needs to survive a restart (the pickup caches inside `PersistedState` are
+/// what actually needs that guarantee).
+#[derive(Debug, Clone, Default)]
+struct SourceHealth {
+    last_success: Option<DateTime<Local>>,
+    last_error: Option<String>,
+    consecutive_failures: u32,
+}
+
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -314,18 +403,14 @@ struct BotState {
     berlin_recycling_creds: Option<(String, String)>,
     waste_labels: HashMap<String, String>,
     waste_colors: HashMap<String, String>,
-    reminder_hour: u32,
-    reminder_minute: u32,
+    reminder_time: NaiveTime,
     http: reqwest::Client,
+    store_path: PathBuf,
     // reminder event_id -> set of display names that confirmed
     confirmed: Arc<Mutex<HashMap<OwnedEventId, HashSet<String>>>>,
-    // Last-known upcoming Berlin Recycling pickups. The portal removes an
-    // imminent pickup from its calendar a day or two before it happens
-    // (presumably once the collection route is finalized), so a same-day
-    // fetch can silently lose it. We keep every future date we've ever
-    // seen and merge it back in, so a pickup we already confirmed once
-    // doesn't disappear just because the source stopped listing it.
-    br_cache: Arc<Mutex<Vec<Pickup>>>,
+    persisted: Arc<Mutex<PersistedState>>,
+    bsr_health: Arc<Mutex<SourceHealth>>,
+    br_health: Arc<Mutex<SourceHealth>>,
 }
 
 // ── Message formatting ────────────────────────────────────────────────────────
@@ -419,11 +504,13 @@ const DONE_REACTIONS: &[&str] = &["✅", "✔", "☑"];
 
 // ── Core logic ────────────────────────────────────────────────────────────────
 
-/// Merge freshly-fetched Berlin Recycling pickups with the cache of
-/// previously-seen upcoming ones. Past entries (before `today`) are dropped
-/// from the cache so it doesn't grow forever; everything else survives even
-/// if `fetched` no longer contains it.
-fn merge_berlin_recycling(cache: &[Pickup], fetched: &[Pickup], today: NaiveDate) -> Vec<Pickup> {
+/// Merge freshly-fetched pickups from one source into the cache of
+/// previously-seen upcoming ones for that source. Past entries (before
+/// `today`) are dropped so the cache doesn't grow forever; everything else
+/// survives even if `fetched` is empty (failed refresh) or no longer lists a
+/// date the cache already had — a source is never allowed to make a known
+/// pickup disappear, only for it to age out once its date has passed.
+fn merge_pickup_cache(cache: &[Pickup], fetched: &[Pickup], today: NaiveDate) -> Vec<Pickup> {
     let mut seen: HashSet<(NaiveDate, String)> = HashSet::new();
     let mut merged: Vec<Pickup> = cache
         .iter()
@@ -436,86 +523,351 @@ fn merge_berlin_recycling(cache: &[Pickup], fetched: &[Pickup], today: NaiveDate
     merged
 }
 
-/// Fetch and merge pickups from all configured sources, sorted by date.
-/// A BSR failure is fatal (it's the primary source); a Berlin Recycling
-/// failure is logged and skipped so the reminder still fires with BSR data.
-///
-/// The Berlin Recycling portal drops an imminent pickup from its calendar
-/// response a day or two before it happens (seemingly once the collection
-/// route is finalized), so a same-day fetch can silently lose it. We merge
-/// each fetch into `state.br_cache` and keep reporting a date we've already
-/// seen until it's in the past, even if a later fetch no longer lists it.
-async fn fetch_all_pickups(state: &BotState) -> Result<Vec<Pickup>> {
-    let mut pickups =
-        fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await?;
+/// Fetch pickups from all configured sources, merge each into its persisted
+/// cache, and return the combined, sorted result. Never fails outright: a
+/// source that errors (network, parsing, auth) just keeps its last-known-good
+/// cache instead of wiping it, and is reflected in that source's `SourceHealth`
+/// for `!garbage status`/`refresh` rather than via an early return that would
+/// have skipped every other source too.
+async fn fetch_all_pickups(state: &BotState) -> Vec<Pickup> {
     let today = Local::now().date_naive();
+    let mut persisted = state.persisted.lock().await;
 
-    if let Some((ref user, ref pass)) = state.berlin_recycling_creds {
-        let mut cache = state.br_cache.lock().await;
-        match fetch_berlin_recycling_pickups(user, pass, &state.waste_labels).await {
-            Ok(br_pickups) => {
-                info!("Berlin Recycling: {} pickup(s) fetched", br_pickups.len());
-                *cache = merge_berlin_recycling(&cache, &br_pickups, today);
+    {
+        let mut health = state.bsr_health.lock().await;
+        match fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await {
+            Ok(fetched) => {
+                info!("BSR: {} pickup(s) fetched", fetched.len());
+                persisted.bsr_cache = merge_pickup_cache(&persisted.bsr_cache, &fetched, today);
+                health.last_success = Some(Local::now());
+                health.last_error = None;
+                health.consecutive_failures = 0;
             }
             Err(e) => {
-                error!("Failed to fetch Berlin Recycling data: {e}");
-                *cache = merge_berlin_recycling(&cache, &[], today);
-                if !cache.is_empty() {
-                    warn!(
-                        "Berlin Recycling: falling back to {} cached pickup(s)",
-                        cache.len()
-                    );
-                }
+                error!("BSR: schedule refresh failed, keeping previous schedule: {e}");
+                persisted.bsr_cache = merge_pickup_cache(&persisted.bsr_cache, &[], today);
+                health.last_error = Some(e.to_string());
+                health.consecutive_failures += 1;
             }
         }
-        pickups.extend(cache.iter().cloned());
-        pickups.sort_by_key(|p| p.date);
     }
 
-    Ok(pickups)
+    let mut pickups = persisted.bsr_cache.clone();
+
+    if let Some((ref user, ref pass)) = state.berlin_recycling_creds {
+        let mut health = state.br_health.lock().await;
+        match fetch_berlin_recycling_pickups(user, pass, &state.waste_labels).await {
+            Ok(fetched) => {
+                info!("Berlin Recycling: {} pickup(s) fetched", fetched.len());
+                persisted.br_cache = merge_pickup_cache(&persisted.br_cache, &fetched, today);
+                health.last_success = Some(Local::now());
+                health.last_error = None;
+                health.consecutive_failures = 0;
+            }
+            Err(e) => {
+                error!("Berlin Recycling: schedule refresh failed, keeping previous schedule: {e}");
+                persisted.br_cache = merge_pickup_cache(&persisted.br_cache, &[], today);
+                health.last_error = Some(e.to_string());
+                health.consecutive_failures += 1;
+            }
+        }
+        pickups.extend(persisted.br_cache.iter().cloned());
+    }
+
+    pickups.sort_by_key(|p| p.date);
+    save_persisted_state(&state.store_path, &persisted).await;
+    pickups
 }
 
-async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
-    let pickups = match fetch_all_pickups(state).await {
-        Ok(p) => p,
-        Err(e) => {
-            error!("Failed to fetch BSR data: {e}");
-            return;
-        }
-    };
+/// All pickups scheduled on exactly `date`.
+fn pickups_for_date(pickups: &[Pickup], date: NaiveDate) -> Vec<Pickup> {
+    pickups.iter().filter(|p| p.date == date).cloned().collect()
+}
 
-    let today = Local::now().date_naive();
-    let tomorrow = today + chrono::Duration::days(1);
-
-    let (pickup_date, day_pickups) = if test_mode {
-        let future: Vec<_> = pickups.iter().filter(|p| p.date >= today).collect();
-        if future.is_empty() {
-            warn!("No upcoming pickups found");
-            return;
+/// Resolve a naive local wall-clock time against a timezone, handling the two
+/// DST edge cases `TimeZone::from_local_datetime` can return:
+/// - "spring forward" gap (e.g. 02:30 doesn't exist) — nudge forward until it
+///   resolves, so a reminder time that falls in the gap fires slightly late
+///   instead of never firing.
+/// - "fall back" overlap (e.g. 02:30 happens twice) — pick the earlier
+///   occurrence, so the reminder fires at the first opportunity.
+fn resolve_local<Tz: TimeZone>(tz: &Tz, naive: chrono::NaiveDateTime) -> DateTime<Tz> {
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => dt,
+        LocalResult::Ambiguous(earlier, _later) => earlier,
+        LocalResult::None => {
+            // DST gaps are at most a couple of hours; try a few nudges before
+            // giving up (would only happen for a pathological reminder_time).
+            (1..=4)
+                .find_map(
+                    |h| match tz.from_local_datetime(&(naive + chrono::Duration::hours(h))) {
+                        LocalResult::Single(dt) => Some(dt),
+                        _ => None,
+                    },
+                )
+                .unwrap_or_else(|| {
+                    tz.from_local_datetime(&naive)
+                        .earliest()
+                        .expect("timezone resolution")
+                })
         }
-        let next_date = future[0].date;
-        let on_day: Vec<Pickup> = pickups
-            .iter()
-            .filter(|p| p.date == next_date)
-            .cloned()
-            .collect();
-        info!("Test mode: using pickup date {next_date}");
-        (next_date, on_day)
+    }
+}
+
+/// The next instant `target_time` occurs at or after `now`, in `now`'s
+/// timezone — today if `target_time` hasn't passed yet, otherwise tomorrow.
+/// DST-aware: computed via `resolve_local` rather than naive datetime
+/// subtraction, which would be off by an hour on the two DST-transition days.
+fn next_reminder_datetime<Tz: TimeZone>(now: DateTime<Tz>, target_time: NaiveTime) -> DateTime<Tz> {
+    let today = now.date_naive();
+    let candidate_date = if now.time() < target_time {
+        today
     } else {
-        let on_day: Vec<Pickup> = pickups
+        today + chrono::Duration::days(1)
+    };
+    resolve_local(&now.timezone(), candidate_date.and_time(target_time))
+}
+
+/// Bounded exponential backoff for reminder-delivery retries: 5s, 10s, 20s...
+/// capped at 5 minutes. Deliberately has no max-attempt cutoff — a reminder
+/// must keep retrying until delivered, not give up and disappear.
+fn backoff_delay(attempt: u32) -> Duration {
+    let secs = 5u64.saturating_mul(1u64 << attempt.min(6));
+    Duration::from_secs(secs.min(300))
+}
+
+/// Room IDs (as strings) that still need this reminder sent.
+fn rooms_pending_delivery(pending: &PendingReminder, joined_room_ids: &[String]) -> Vec<String> {
+    joined_room_ids
+        .iter()
+        .filter(|id| !pending.sent_room_ids.contains(*id))
+        .cloned()
+        .collect()
+}
+
+/// True once every currently-joined room has received the reminder. False
+/// (not true) if there are no joined rooms at all — nothing has actually been
+/// delivered yet, so it must not be mistaken for "done".
+fn is_fully_delivered(pending: &PendingReminder, joined_room_ids: &[String]) -> bool {
+    !joined_room_ids.is_empty()
+        && joined_room_ids
             .iter()
-            .filter(|p| p.date == tomorrow)
-            .cloned()
-            .collect();
-        (tomorrow, on_day)
+            .all(|id| pending.sent_room_ids.contains(id))
+}
+
+/// Pure: whether a new reminder should be created right now, and for which
+/// date. Returns `None` if it's not due yet, one is already pending, or
+/// today's slot was already evaluated (sent or found empty).
+fn should_start_new_reminder(
+    now_date: NaiveDate,
+    now_time: NaiveTime,
+    target_time: NaiveTime,
+    last_checked_date: Option<NaiveDate>,
+    has_pending: bool,
+) -> Option<NaiveDate> {
+    if has_pending || now_time < target_time {
+        return None;
+    }
+    let target_date = now_date + chrono::Duration::days(1);
+    if last_checked_date == Some(target_date) {
+        return None;
+    }
+    Some(target_date)
+}
+
+/// Send `plain`/`html` to one room, track it for ✅ confirmations, and seed a
+/// ✅ reaction so users have an immediate button to tap. Shared by the
+/// persisted/retried production path and the ephemeral `--test` path so
+/// there's exactly one place that knows how to deliver a reminder message.
+async fn deliver_reminder_to_room(
+    state: &BotState,
+    room: &Room,
+    plain: &str,
+    html: &str,
+) -> matrix_sdk::Result<OwnedEventId> {
+    let mut content = RoomMessageEventContent::text_html(plain.to_owned(), html.to_owned());
+    let mut mentions = Mentions::new();
+    mentions.room = true;
+    content = content.add_mentions(mentions);
+    let resp = room.send(content).await?;
+    let event_id = resp.response.event_id;
+
+    state
+        .confirmed
+        .lock()
+        .await
+        .insert(event_id.clone(), HashSet::new());
+
+    let reaction = ReactionEventContent::new(Annotation::new(event_id.clone(), "✅".to_owned()));
+    if let Err(e) = room.send(reaction).await {
+        warn!(
+            "Failed to seed confirmation reaction in {}: {e}",
+            room.room_id()
+        );
+    }
+    Ok(event_id)
+}
+
+/// Attempt to complete delivery of the persisted pending reminder, if any.
+/// Safe to call repeatedly: rooms already in `sent_room_ids` are skipped, so
+/// retries (and restart recovery, since `pending_reminder` is loaded straight
+/// from disk) never duplicate a send. Only marks the reminder as sent once
+/// every currently-joined room has it.
+async fn resolve_pending_reminder(state: &BotState, client: &Client) {
+    let pending = { state.persisted.lock().await.pending_reminder.clone() };
+    let Some(mut pending) = pending else {
+        return;
     };
 
-    if day_pickups.is_empty() {
-        info!("No pickups on {pickup_date}, skipping reminder.");
-        return;
+    let rooms = client.joined_rooms();
+    let joined_ids: Vec<String> = rooms.iter().map(|r| r.room_id().to_string()).collect();
+    let targets = rooms_pending_delivery(&pending, &joined_ids);
+
+    if joined_ids.is_empty() {
+        warn!(
+            "Reminder for {} still pending — no joined rooms yet (attempt {})",
+            pending.date,
+            pending.attempt + 1
+        );
     }
 
-    // Wait up to 30s for the first sync to populate rooms (needed in --test mode)
+    let (plain, html) = build_reminder(&pending.pickups, pending.date, &state.waste_colors);
+    for room in &rooms {
+        let room_id = room.room_id().to_string();
+        if !targets.contains(&room_id) {
+            continue;
+        }
+        match deliver_reminder_to_room(state, room, &plain, &html).await {
+            Ok(event_id) => {
+                info!(
+                    "Reminder delivered: room={room_id} date={} event_id={event_id}",
+                    pending.date
+                );
+                pending.sent_room_ids.insert(room_id);
+            }
+            Err(e) => error!(
+                "Reminder send failed: room={room_id} date={} attempt={} error={e}",
+                pending.date,
+                pending.attempt + 1
+            ),
+        }
+    }
+
+    let mut persisted = state.persisted.lock().await;
+    if is_fully_delivered(&pending, &joined_ids) {
+        info!("Reminder for {} fully delivered", pending.date);
+        persisted.last_sent_date = Some(pending.date);
+        persisted.pending_reminder = None;
+    } else {
+        pending.attempt += 1;
+        let delay = backoff_delay(pending.attempt);
+        warn!(
+            "Reminder for {} not yet fully delivered, retrying in {}s (attempt {})",
+            pending.date,
+            delay.as_secs(),
+            pending.attempt
+        );
+        persisted.pending_reminder = Some(pending);
+    }
+    save_persisted_state(&state.store_path, &persisted).await;
+}
+
+/// If a new reminder is due, fetch the schedule and persist it as pending
+/// *before* attempting any send — so a crash right after this still leaves a
+/// recoverable record on restart. `resolve_pending_reminder` does the actual
+/// sending, whether called right after this or on a later retry/restart.
+async fn maybe_start_reminder(state: &BotState, target_time: NaiveTime) {
+    let now = Local::now();
+    let (last_checked_date, has_pending) = {
+        let persisted = state.persisted.lock().await;
+        (
+            persisted.last_checked_date,
+            persisted.pending_reminder.is_some(),
+        )
+    };
+    let Some(target_date) = should_start_new_reminder(
+        now.date_naive(),
+        now.time(),
+        target_time,
+        last_checked_date,
+        has_pending,
+    ) else {
+        return;
+    };
+
+    let pickups = fetch_all_pickups(state).await;
+    let day_pickups = pickups_for_date(&pickups, target_date);
+
+    let mut persisted = state.persisted.lock().await;
+    persisted.last_checked_date = Some(target_date);
+    if day_pickups.is_empty() {
+        info!("No pickups on {target_date}, skipping reminder.");
+    } else {
+        info!(
+            "Reminder due for {target_date}: {} pickup(s)",
+            day_pickups.len()
+        );
+        persisted.pending_reminder = Some(PendingReminder {
+            date: target_date,
+            pickups: day_pickups,
+            sent_room_ids: HashSet::new(),
+            attempt: 0,
+        });
+    }
+    save_persisted_state(&state.store_path, &persisted).await;
+}
+
+async fn run_scheduler(state: BotState, client: Client) {
+    let target_time = state.reminder_time;
+    loop {
+        // Order matters: create today's pending reminder first (if due), then
+        // attempt delivery in the same tick — a freshly-created reminder
+        // doesn't wait for the next tick just to make its first send attempt.
+        maybe_start_reminder(&state, target_time).await;
+        resolve_pending_reminder(&state, &client).await;
+
+        let pending_attempt = {
+            let persisted = state.persisted.lock().await;
+            persisted.pending_reminder.as_ref().map(|p| p.attempt)
+        };
+        let sleep_dur = match pending_attempt {
+            Some(attempt) => backoff_delay(attempt),
+            None => {
+                let now = Local::now();
+                let target_dt = next_reminder_datetime(now, target_time);
+                Duration::from_secs((target_dt - now).num_seconds().max(1) as u64)
+            }
+        };
+        info!(
+            "Scheduler sleeping {}s (pending={})",
+            sleep_dur.as_secs(),
+            pending_attempt.is_some()
+        );
+        sleep(sleep_dur).await;
+    }
+}
+
+/// One-shot `--test` path: send the next upcoming reminder immediately and
+/// don't loop. Deliberately does not touch `state.persisted`'s pending/sent
+/// tracking — it's a manual dev trigger, not part of the daily production
+/// cadence, and shouldn't affect what the real scheduler considers "already
+/// sent".
+async fn send_test_reminder(state: &BotState, client: &Client) {
+    let pickups = fetch_all_pickups(state).await;
+    let today = Local::now().date_naive();
+    let Some(next_date) = pickups
+        .iter()
+        .filter(|p| p.date >= today)
+        .map(|p| p.date)
+        .min()
+    else {
+        warn!("No upcoming pickups found");
+        return;
+    };
+    let day_pickups = pickups_for_date(&pickups, next_date);
+    info!("Test mode: using pickup date {next_date}");
+
+    // Wait up to 30s for the first sync to populate rooms.
     let mut tries = 0u32;
     let rooms = loop {
         let joined = client.joined_rooms();
@@ -530,58 +882,16 @@ async fn check_and_remind(state: &BotState, client: &Client, test_mode: bool) {
         tries += 1;
     };
 
-    let (plain, html) = build_reminder(&day_pickups, pickup_date, &state.waste_colors);
+    let (plain, html) = build_reminder(&day_pickups, next_date, &state.waste_colors);
     for room in rooms {
-        let mut content = RoomMessageEventContent::text_html(plain.clone(), html.clone());
-        let mut mentions = Mentions::new();
-        mentions.room = true;
-        content = content.add_mentions(mentions);
-        match room.send(content).await {
-            Ok(resp) => {
-                let event_id = resp.response.event_id;
-                info!("Sent reminder to {}, event_id={}", room.room_id(), event_id);
-                state
-                    .confirmed
-                    .lock()
-                    .await
-                    .insert(event_id.clone(), HashSet::new());
-                // React with ✅ so users see a button they can click immediately.
-                let reaction =
-                    ReactionEventContent::new(Annotation::new(event_id, "✅".to_owned()));
-                if let Err(e) = room.send(reaction).await {
-                    warn!("Failed to react to reminder: {e}");
-                }
-            }
-            Err(e) => error!("Failed to send reminder to {}: {e}", room.room_id()),
+        match deliver_reminder_to_room(state, &room, &plain, &html).await {
+            Ok(event_id) => info!(
+                "Sent test reminder to {}, event_id={}",
+                room.room_id(),
+                event_id
+            ),
+            Err(e) => error!("Failed to send test reminder to {}: {e}", room.room_id()),
         }
-    }
-}
-
-async fn scheduler_loop(state: BotState, client: Client, test_mode: bool) {
-    if test_mode {
-        info!("Test mode: sending next upcoming reminder immediately");
-        check_and_remind(&state, &client, true).await;
-        info!("Test reminder sent. Waiting for reactions (Ctrl+C to quit)...");
-        return;
-    }
-
-    loop {
-        let now = Local::now();
-        let target = NaiveTime::from_hms_opt(state.reminder_hour, state.reminder_minute, 0)
-            .expect("invalid reminder time");
-        let today = now.date_naive();
-        let next_dt = if now.time() < target {
-            today.and_time(target)
-        } else {
-            (today + chrono::Duration::days(1)).and_time(target)
-        };
-        let secs = (next_dt - now.naive_local()).num_seconds().max(0) as u64;
-        info!(
-            "Next reminder in {secs}s (at {:02}:{:02})",
-            state.reminder_hour, state.reminder_minute
-        );
-        sleep(Duration::from_secs(secs)).await;
-        check_and_remind(&state, &client, false).await;
     }
 }
 
@@ -595,6 +905,12 @@ enum GarbageCommand {
     NextEvent,
     /// `!garbage week` — every pickup in the next 7 days.
     Week,
+    /// `!garbage status` — source health, reminder/scheduler state.
+    Status,
+    /// `!garbage refresh` (admin-only) — force a schedule refresh now.
+    Refresh,
+    /// `!garbage version` — deployed build version.
+    Version,
     /// `!garbage help` (or an unrecognized subcommand) — usage text.
     Help,
 }
@@ -609,6 +925,9 @@ fn parse_garbage_command(body: &str) -> Option<GarbageCommand> {
         "" => GarbageCommand::NextPerType,
         "next" => GarbageCommand::NextEvent,
         "week" => GarbageCommand::Week,
+        "status" => GarbageCommand::Status,
+        "refresh" => GarbageCommand::Refresh,
+        "version" => GarbageCommand::Version,
         _ => GarbageCommand::Help,
     })
 }
@@ -705,9 +1024,73 @@ fn garbage_empty_message() -> (String, String) {
 fn garbage_help_message() -> (String, String) {
     let plain = "🗑️ !garbage — next per type\n\
                   !garbage next — next collection\n\
-                  !garbage week — next 7 days"
+                  !garbage week — next 7 days\n\
+                  !garbage status — source/reminder health\n\
+                  !garbage refresh — force refresh (admin)\n\
+                  !garbage version — build version"
         .to_owned();
     let html = plain.replace('\n', "<br>");
+    (plain, html)
+}
+
+fn garbage_version_message() -> (String, String) {
+    let text = format!("🗑️ garbage-bot v{}", env!("CARGO_PKG_VERSION"));
+    (text.clone(), text)
+}
+
+/// One-line human summary of a source's health for `!garbage status`.
+fn describe_source_health(health: &SourceHealth, cached_count: usize) -> String {
+    match (&health.last_success, &health.last_error) {
+        (Some(t), None) => format!(
+            "ok · {cached_count} cached · refreshed {}",
+            t.format("%d.%m %H:%M")
+        ),
+        (Some(t), Some(e)) => format!(
+            "degraded ({e}) · {cached_count} cached from {} · {} failure(s) since",
+            t.format("%d.%m %H:%M"),
+            health.consecutive_failures
+        ),
+        (None, Some(e)) => format!("failing ({e}) · {cached_count} cached · never succeeded"),
+        (None, None) => "not checked yet".to_owned(),
+    }
+}
+
+/// One-line human summary of the reminder scheduler's current state.
+fn describe_reminder_state(persisted: &PersistedState) -> String {
+    match &persisted.pending_reminder {
+        Some(p) => format!(
+            "pending for {} · attempt {} · {} room(s) confirmed",
+            p.date,
+            p.attempt,
+            p.sent_room_ids.len()
+        ),
+        None => match persisted.last_sent_date {
+            Some(d) => format!("last sent {d}"),
+            None => "none sent yet".to_owned(),
+        },
+    }
+}
+
+async fn build_status_message(state: &BotState) -> (String, String) {
+    let persisted = state.persisted.lock().await;
+    let bsr_health = state.bsr_health.lock().await.clone();
+
+    let mut lines = vec!["🗑️ Status".to_owned()];
+    lines.push(format!(
+        "BSR: {}",
+        describe_source_health(&bsr_health, persisted.bsr_cache.len())
+    ));
+    if state.berlin_recycling_creds.is_some() {
+        let br_health = state.br_health.lock().await.clone();
+        lines.push(format!(
+            "Paper: {}",
+            describe_source_health(&br_health, persisted.br_cache.len())
+        ));
+    }
+    lines.push(format!("Reminder: {}", describe_reminder_state(&persisted)));
+
+    let plain = lines.join("\n");
+    let html = escape_html(&plain).replace('\n', "<br>");
     (plain, html)
 }
 
@@ -766,24 +1149,37 @@ fn build_garbage_reply(
             today,
             colors,
         ),
+        GarbageCommand::Status | GarbageCommand::Refresh | GarbageCommand::Version => {
+            unreachable!("handled directly in handle_garbage_command")
+        }
         GarbageCommand::Help => garbage_help_message(),
     }
 }
 
-async fn handle_garbage_command(state: BotState, room: Room, cmd: GarbageCommand) {
-    let (plain, html) = if cmd == GarbageCommand::Help {
-        garbage_help_message()
-    } else {
-        match fetch_all_pickups(&state).await {
-            Ok(pickups) => {
-                let pickups = dedup_pickups(pickups);
-                let today = Local::now().date_naive();
-                build_garbage_reply(cmd, &pickups, today, &state.waste_colors)
+async fn handle_garbage_command(
+    state: BotState,
+    room: Room,
+    cmd: GarbageCommand,
+    sender: OwnedUserId,
+) {
+    let (plain, html) = match cmd {
+        GarbageCommand::Help => garbage_help_message(),
+        GarbageCommand::Version => garbage_version_message(),
+        GarbageCommand::Status => build_status_message(&state).await,
+        GarbageCommand::Refresh => {
+            if !state.admin_users.contains(&sender) {
+                let msg = "⛔ Admin only.".to_owned();
+                (msg.clone(), msg)
+            } else {
+                info!("!garbage refresh requested by {sender}");
+                fetch_all_pickups(&state).await;
+                build_status_message(&state).await
             }
-            Err(e) => {
-                error!("!garbage: failed to fetch pickups: {e}");
-                garbage_empty_message()
-            }
+        }
+        GarbageCommand::NextPerType | GarbageCommand::NextEvent | GarbageCommand::Week => {
+            let pickups = dedup_pickups(fetch_all_pickups(&state).await);
+            let today = Local::now().date_naive();
+            build_garbage_reply(cmd, &pickups, today, &state.waste_colors)
         }
     };
 
@@ -799,7 +1195,17 @@ async fn handle_garbage_command(state: BotState, room: Room, cmd: GarbageCommand
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // matrix-sdk's own info/debug logging is very chatty (full sync bodies,
+    // crypto internals); at that volume it can rotate our own — much rarer —
+    // logs out of the container's capped log file before anyone reads them.
+    // Keep our crate at `info` and everything else at `warn` by default,
+    // same pattern as the other bots; RUST_LOG still overrides this.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "garbage_bot=info,matrix_sdk=warn".parse().unwrap()),
+        )
+        .init();
 
     let test_mode = std::env::args().any(|a| a == "--test");
     let config_path = std::env::args()
@@ -834,13 +1240,17 @@ async fn main() -> Result<()> {
             }
         };
 
-    let reminder_time = config.reminder.reminder_time.clone();
-    let (reminder_hour, reminder_minute) = {
-        let parts: Vec<&str> = reminder_time.splitn(2, ':').collect();
+    let reminder_time_str = config.reminder.reminder_time.clone();
+    let reminder_time = {
+        let parts: Vec<&str> = reminder_time_str.splitn(2, ':').collect();
+        let invalid =
+            || anyhow!("Invalid reminder_time: {reminder_time_str} (expected HH:MM, 00:00-23:59)");
         if parts.len() != 2 {
-            return Err(anyhow!("Invalid reminder_time: {reminder_time}"));
+            return Err(invalid());
         }
-        (parts[0].parse::<u32>()?, parts[1].parse::<u32>()?)
+        let hour: u32 = parts[0].parse().map_err(|_| invalid())?;
+        let minute: u32 = parts[1].parse().map_err(|_| invalid())?;
+        NaiveTime::from_hms_opt(hour, minute, 0).ok_or_else(invalid)?
     };
 
     let store_path =
@@ -874,7 +1284,7 @@ async fn main() -> Result<()> {
     verification.install_handlers();
 
     if admin_users.is_empty() {
-        warn!("No admin_users configured — !reset-trust command is disabled");
+        warn!("No admin_users configured — !reset-trust and !garbage refresh are disabled");
     } else {
         info!("Admin users: {admin_users:?}");
     }
@@ -890,6 +1300,17 @@ async fn main() -> Result<()> {
         info!("Berlin Recycling credentials configured — paper pickups enabled");
     }
 
+    let reminder_state_path = store_path.join("reminder_state.json");
+    let persisted = load_persisted_state(&reminder_state_path).await;
+    if let Some(ref pending) = persisted.pending_reminder {
+        info!(
+            "Restart recovery: found pending reminder for {} (attempt {}, {} room(s) already confirmed) — will resume delivery",
+            pending.date,
+            pending.attempt,
+            pending.sent_room_ids.len()
+        );
+    }
+
     let state = BotState {
         bot_user_id: user_id,
         admin_users,
@@ -899,11 +1320,13 @@ async fn main() -> Result<()> {
         berlin_recycling_creds,
         waste_labels: config.waste_labels,
         waste_colors: config.waste_colors,
-        reminder_hour,
-        reminder_minute,
+        reminder_time,
         http: reqwest::Client::new(),
+        store_path: reminder_state_path,
         confirmed: Arc::new(Mutex::new(HashMap::new())),
-        br_cache: Arc::new(Mutex::new(Vec::new())),
+        persisted: Arc::new(Mutex::new(persisted)),
+        bsr_health: Arc::new(Mutex::new(SourceHealth::default())),
+        br_health: Arc::new(Mutex::new(SourceHealth::default())),
     };
 
     // Auto-join invited rooms (only from allowed_inviters)
@@ -991,7 +1414,12 @@ async fn main() -> Result<()> {
                     return;
                 }
                 if let Some(cmd) = parse_garbage_command(raw) {
-                    tokio::spawn(handle_garbage_command(state.clone(), room, cmd));
+                    tokio::spawn(handle_garbage_command(
+                        state.clone(),
+                        room,
+                        cmd,
+                        ev.sender.clone(),
+                    ));
                 }
             }
         }
@@ -1012,7 +1440,19 @@ async fn main() -> Result<()> {
     });
 
     // Scheduler
-    tokio::spawn(scheduler_loop(state.clone(), client.clone(), test_mode));
+    tokio::spawn({
+        let state = state.clone();
+        let client = client.clone();
+        async move {
+            if test_mode {
+                info!("Test mode: sending next upcoming reminder immediately");
+                send_test_reminder(&state, &client).await;
+                info!("Test reminder sent. Waiting for reactions (Ctrl+C to quit)...");
+            } else {
+                run_scheduler(state, client).await;
+            }
+        }
+    });
 
     info!("Starting sync...");
     let filter = FilterDefinition::with_lazy_loading();
@@ -1341,18 +1781,23 @@ mod tests {
         assert!(plain.contains("!garbage"));
         assert!(plain.contains("next"));
         assert!(plain.contains("week"));
-        assert!(plain.len() < 200);
+        assert!(plain.contains("status"));
+        assert!(plain.contains("refresh"));
+        assert!(plain.contains("version"));
+        assert!(plain.len() < 350);
     }
 
-    // ── Berlin Recycling cache ────────────────────────────────────────────────
-    // Regression coverage for the portal dropping an imminent pickup from its
-    // calendar response a day or two before it happens: a date we've already
-    // seen once must keep showing up even if a later fetch no longer lists it.
+    // ── Pickup cache merging ─────────────────────────────────────────────────
+    // Regression coverage for a source dropping an imminent pickup from its
+    // response a day or two before it happens (observed on the Berlin
+    // Recycling portal): a date we've already seen once must keep showing up
+    // even if a later fetch no longer lists it — for either source, since a
+    // failed BSR refresh must not wipe a known-good BSR schedule either.
 
     #[test]
     fn merge_with_empty_cache_returns_fetched_future_dates() {
         let fetched = vec![pickup(1, "Paper"), pickup(8, "Paper")];
-        let merged = merge_berlin_recycling(&[], &fetched, today());
+        let merged = merge_pickup_cache(&[], &fetched, today());
         assert_eq!(merged.len(), 2);
     }
 
@@ -1362,7 +1807,7 @@ mod tests {
         // the portal already dropped it — no longer includes it.
         let cache = vec![pickup(1, "Paper"), pickup(8, "Paper")];
         let fetched = vec![pickup(8, "Paper")]; // tomorrow's entry vanished from the source
-        let merged = merge_berlin_recycling(&cache, &fetched, today());
+        let merged = merge_pickup_cache(&cache, &fetched, today());
 
         assert_eq!(merged.len(), 2);
         assert!(merged
@@ -1373,7 +1818,7 @@ mod tests {
     #[test]
     fn merge_drops_past_cached_entries_instead_of_resurrecting_them() {
         let cache = vec![pickup(-7, "Paper"), pickup(1, "Paper")];
-        let merged = merge_berlin_recycling(&cache, &[], today());
+        let merged = merge_pickup_cache(&cache, &[], today());
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].date, today() + chrono::Duration::days(1));
@@ -1383,7 +1828,7 @@ mod tests {
     fn merge_deduplicates_a_date_present_in_both_cache_and_fetch() {
         let cache = vec![pickup(1, "Paper")];
         let fetched = vec![pickup(1, "Paper")];
-        let merged = merge_berlin_recycling(&cache, &fetched, today());
+        let merged = merge_pickup_cache(&cache, &fetched, today());
         assert_eq!(merged.len(), 1);
     }
 
@@ -1392,7 +1837,7 @@ mod tests {
         // fetch_all_pickups passes an empty slice on a failed Berlin Recycling
         // fetch; previously-cached upcoming dates must still come through.
         let cache = vec![pickup(1, "Paper"), pickup(8, "Paper")];
-        let merged = merge_berlin_recycling(&cache, &[], today());
+        let merged = merge_pickup_cache(&cache, &[], today());
         assert_eq!(merged.len(), 2);
     }
 
@@ -1400,7 +1845,7 @@ mod tests {
     fn merge_result_is_sorted_by_date_then_label() {
         let cache = vec![pickup(8, "Residual"), pickup(1, "Paper")];
         let fetched = vec![pickup(1, "Organic")];
-        let merged = merge_berlin_recycling(&cache, &fetched, today());
+        let merged = merge_pickup_cache(&cache, &fetched, today());
 
         let dates: Vec<_> = merged.iter().map(|p| (p.date, p.label.as_str())).collect();
         assert_eq!(
@@ -1411,5 +1856,258 @@ mod tests {
                 (today() + chrono::Duration::days(8), "Residual"),
             ]
         );
+    }
+
+    #[test]
+    fn pickups_for_date_filters_exact_match_only() {
+        let pickups = vec![pickup(0, "A"), pickup(1, "B"), pickup(1, "C")];
+        let result = pickups_for_date(&pickups, today() + chrono::Duration::days(1));
+        let labels: Vec<&str> = result.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, vec!["B", "C"]);
+    }
+
+    // ── Reminder scheduling: DST-aware timing ─────────────────────────────────
+    // Uses chrono-tz's real IANA rules for Europe/Berlin so these are exact and
+    // don't depend on the host machine's configured timezone. This is the
+    // reliability fix for a real bug: computing the next reminder instant via
+    // naive datetime subtraction is off by exactly one hour on the two annual
+    // DST-transition days, because it silently assumes every day is 24h.
+
+    #[test]
+    fn next_reminder_datetime_same_day_before_target() {
+        use chrono_tz::Europe::Berlin;
+        // 2026-07-20 is a normal summer (CEST) day, no DST transition.
+        let now = Berlin.with_ymd_and_hms(2026, 7, 20, 10, 0, 0).unwrap();
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let next = next_reminder_datetime(now, target);
+        assert_eq!(
+            next,
+            Berlin.with_ymd_and_hms(2026, 7, 20, 20, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn next_reminder_datetime_rolls_to_tomorrow_after_target() {
+        use chrono_tz::Europe::Berlin;
+        let now = Berlin.with_ymd_and_hms(2026, 7, 20, 20, 0, 1).unwrap();
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let next = next_reminder_datetime(now, target);
+        assert_eq!(
+            next,
+            Berlin.with_ymd_and_hms(2026, 7, 21, 20, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn next_reminder_datetime_correct_across_spring_forward() {
+        use chrono_tz::Europe::Berlin;
+        // Europe/Berlin springs forward 2026-03-29 02:00 CET -> 03:00 CEST.
+        // A naive-subtraction implementation would compute one hour too many
+        // (treating the 23-hour day as 24h), firing the reminder an hour late.
+        let now = Berlin.with_ymd_and_hms(2026, 3, 28, 20, 0, 0).unwrap();
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let next = next_reminder_datetime(now, target);
+        let expected = Berlin.with_ymd_and_hms(2026, 3, 29, 20, 0, 0).unwrap();
+        assert_eq!(next, expected);
+        assert_eq!((next - now).num_minutes(), 23 * 60); // 23h day, not 24h
+    }
+
+    #[test]
+    fn next_reminder_datetime_correct_across_fall_back() {
+        use chrono_tz::Europe::Berlin;
+        // Europe/Berlin falls back 2026-10-25 03:00 CEST -> 02:00 CET (25h day).
+        let now = Berlin.with_ymd_and_hms(2026, 10, 24, 20, 0, 0).unwrap();
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let next = next_reminder_datetime(now, target);
+        let expected = Berlin.with_ymd_and_hms(2026, 10, 25, 20, 0, 0).unwrap();
+        assert_eq!(next, expected);
+        assert_eq!((next - now).num_minutes(), 25 * 60); // 25h day, not 24h
+    }
+
+    #[test]
+    fn resolve_local_picks_earlier_occurrence_in_fall_back_overlap() {
+        use chrono::Offset;
+        use chrono_tz::Europe::Berlin;
+        // 02:30 on 2026-10-25 happens twice (CEST then CET); must resolve to
+        // the first occurrence so a reminder due in that window fires ASAP.
+        let naive = NaiveDate::from_ymd_opt(2026, 10, 25)
+            .unwrap()
+            .and_hms_opt(2, 30, 0)
+            .unwrap();
+        let resolved = resolve_local(&Berlin, naive);
+        assert_eq!(resolved.naive_local(), naive);
+        assert_eq!(resolved.offset().fix().local_minus_utc(), 2 * 3600); // still CEST
+    }
+
+    #[test]
+    fn resolve_local_nudges_forward_through_spring_forward_gap() {
+        use chrono_tz::Europe::Berlin;
+        // 02:30 on 2026-03-29 never happens (clocks jump 02:00 -> 03:00).
+        let naive = NaiveDate::from_ymd_opt(2026, 3, 29)
+            .unwrap()
+            .and_hms_opt(2, 30, 0)
+            .unwrap();
+        let resolved = resolve_local(&Berlin, naive);
+        // Must resolve to *something* after the gap, not panic or go backwards.
+        assert!(resolved.naive_local() >= naive);
+        assert_eq!(resolved.naive_local().date(), naive.date());
+    }
+
+    // ── Reminder scheduling: backoff and due-check ────────────────────────────
+
+    #[test]
+    fn backoff_delay_is_bounded_exponential() {
+        assert_eq!(backoff_delay(0), Duration::from_secs(5));
+        assert_eq!(backoff_delay(1), Duration::from_secs(10));
+        assert_eq!(backoff_delay(2), Duration::from_secs(20));
+        assert_eq!(backoff_delay(10), Duration::from_secs(300)); // capped, never gives up
+    }
+
+    #[test]
+    fn should_not_start_before_target_time() {
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let now_time = NaiveTime::from_hms_opt(19, 59, 59).unwrap();
+        assert_eq!(
+            should_start_new_reminder(today(), now_time, target, None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn should_start_exactly_at_target_time_for_tomorrow() {
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let result = should_start_new_reminder(today(), target, target, None, false);
+        assert_eq!(result, Some(today() + chrono::Duration::days(1)));
+    }
+
+    #[test]
+    fn should_not_start_a_second_pending_reminder() {
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        assert_eq!(
+            should_start_new_reminder(today(), target, target, None, true),
+            None
+        );
+    }
+
+    #[test]
+    fn should_not_restart_a_reminder_already_checked_today() {
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let tomorrow = today() + chrono::Duration::days(1);
+        assert_eq!(
+            should_start_new_reminder(today(), target, target, Some(tomorrow), false),
+            None
+        );
+    }
+
+    #[test]
+    fn should_start_again_once_the_date_rolls_over() {
+        // last_checked_date is yesterday's target — a new day means a new check.
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let stale_checked_date = today(); // was "tomorrow" relative to yesterday
+        let result =
+            should_start_new_reminder(today(), target, target, Some(stale_checked_date), false);
+        assert_eq!(result, Some(today() + chrono::Duration::days(1)));
+    }
+
+    // ── Reminder delivery: duplicate prevention across rooms/restarts ────────
+
+    fn pending(sent: &[&str], attempt: u32) -> PendingReminder {
+        PendingReminder {
+            date: today() + chrono::Duration::days(1),
+            pickups: vec![pickup(1, "Organic")],
+            sent_room_ids: sent.iter().map(|s| s.to_string()).collect(),
+            attempt,
+        }
+    }
+
+    #[test]
+    fn rooms_pending_delivery_excludes_already_sent_rooms() {
+        let p = pending(&["!a:x"], 0);
+        let joined = vec!["!a:x".to_owned(), "!b:x".to_owned()];
+        assert_eq!(rooms_pending_delivery(&p, &joined), vec!["!b:x".to_owned()]);
+    }
+
+    #[test]
+    fn rooms_pending_delivery_empty_once_all_rooms_sent() {
+        let p = pending(&["!a:x", "!b:x"], 2);
+        let joined = vec!["!a:x".to_owned(), "!b:x".to_owned()];
+        assert!(rooms_pending_delivery(&p, &joined).is_empty());
+    }
+
+    #[test]
+    fn is_fully_delivered_true_only_when_every_joined_room_has_it() {
+        let joined = vec!["!a:x".to_owned(), "!b:x".to_owned()];
+        assert!(!is_fully_delivered(&pending(&["!a:x"], 1), &joined));
+        assert!(is_fully_delivered(&pending(&["!a:x", "!b:x"], 1), &joined));
+    }
+
+    #[test]
+    fn is_fully_delivered_false_with_no_joined_rooms() {
+        // Not "vacuously delivered" — there must be an actual room that got it.
+        assert!(!is_fully_delivered(&pending(&[], 0), &[]));
+    }
+
+    #[test]
+    fn is_fully_delivered_survives_restart_via_persisted_sent_room_ids() {
+        // Simulates: room A succeeded before a restart, room B is new/retried
+        // after. sent_room_ids (loaded straight from disk) must remember A.
+        let p = pending(&["!a:x"], 3);
+        let joined = vec!["!a:x".to_owned(), "!b:x".to_owned()];
+        assert_eq!(rooms_pending_delivery(&p, &joined), vec!["!b:x".to_owned()]);
+        assert!(!is_fully_delivered(&p, &joined));
+    }
+
+    // ── Persisted state: load/save round trip and corruption handling ────────
+
+    #[tokio::test]
+    async fn persisted_state_missing_file_yields_default() {
+        let dir = std::env::temp_dir().join(format!("garbage-bot-test-{}", uuid_ish()));
+        let path = dir.join("reminder_state.json");
+        let state = load_persisted_state(&path).await;
+        assert!(state.bsr_cache.is_empty());
+        assert!(state.pending_reminder.is_none());
+    }
+
+    #[tokio::test]
+    async fn persisted_state_corrupt_file_yields_default_not_panic() {
+        let dir = std::env::temp_dir().join(format!("garbage-bot-test-{}", uuid_ish()));
+        fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("reminder_state.json");
+        fs::write(&path, b"{ not valid json").await.unwrap();
+
+        let state = load_persisted_state(&path).await;
+        assert!(state.bsr_cache.is_empty());
+        assert!(state.pending_reminder.is_none());
+    }
+
+    #[tokio::test]
+    async fn persisted_state_round_trips_through_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("garbage-bot-test-{}", uuid_ish()));
+        fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("reminder_state.json");
+
+        let original = PersistedState {
+            bsr_cache: vec![pickup(1, "Organic")],
+            last_sent_date: Some(today()),
+            pending_reminder: Some(pending(&["!a:x"], 2)),
+            ..Default::default()
+        };
+
+        save_persisted_state(&path, &original).await;
+        let loaded = load_persisted_state(&path).await;
+
+        assert_eq!(loaded.bsr_cache, original.bsr_cache);
+        assert_eq!(loaded.last_sent_date, original.last_sent_date);
+        let loaded_pending = loaded.pending_reminder.expect("pending reminder");
+        assert_eq!(loaded_pending.date, pending(&["!a:x"], 2).date);
+        assert_eq!(loaded_pending.attempt, 2);
+        assert!(loaded_pending.sent_room_ids.contains("!a:x"));
+    }
+
+    fn uuid_ish() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     }
 }
