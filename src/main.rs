@@ -405,7 +405,11 @@ struct BotState {
     waste_colors: HashMap<String, String>,
     reminder_time: NaiveTime,
     http: reqwest::Client,
-    store_path: PathBuf,
+    /// Path to the persisted reminder-state JSON file (not the store
+    /// *directory* — see `reminder_state_path` in `main`), on the same
+    /// bind-mounted volume as the Matrix session store so it survives
+    /// container restarts/recreation.
+    reminder_state_path: PathBuf,
     // reminder event_id -> set of display names that confirmed
     confirmed: Arc<Mutex<HashMap<OwnedEventId, HashSet<String>>>>,
     persisted: Arc<Mutex<PersistedState>>,
@@ -575,7 +579,7 @@ async fn fetch_all_pickups(state: &BotState) -> Vec<Pickup> {
     }
 
     pickups.sort_by_key(|p| p.date);
-    save_persisted_state(&state.store_path, &persisted).await;
+    save_persisted_state(&state.reminder_state_path, &persisted).await;
     pickups
 }
 
@@ -769,7 +773,7 @@ async fn resolve_pending_reminder(state: &BotState, client: &Client) {
         );
         persisted.pending_reminder = Some(pending);
     }
-    save_persisted_state(&state.store_path, &persisted).await;
+    save_persisted_state(&state.reminder_state_path, &persisted).await;
 }
 
 /// If a new reminder is due, fetch the schedule and persist it as pending
@@ -814,7 +818,7 @@ async fn maybe_start_reminder(state: &BotState, target_time: NaiveTime) {
             attempt: 0,
         });
     }
-    save_persisted_state(&state.store_path, &persisted).await;
+    save_persisted_state(&state.reminder_state_path, &persisted).await;
 }
 
 async fn run_scheduler(state: BotState, client: Client) {
@@ -1322,7 +1326,7 @@ async fn main() -> Result<()> {
         waste_colors: config.waste_colors,
         reminder_time,
         http: reqwest::Client::new(),
-        store_path: reminder_state_path,
+        reminder_state_path,
         confirmed: Arc::new(Mutex::new(HashMap::new())),
         persisted: Arc::new(Mutex::new(persisted)),
         bsr_health: Arc::new(Mutex::new(SourceHealth::default())),
