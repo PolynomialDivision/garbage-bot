@@ -31,6 +31,12 @@ password = "yourpassword"
 [reminder]
 # Local time (24h) to send the reminder the evening before pickup
 reminder_time = "20:00"
+# How long (in minutes) a reminder keeps retrying after becoming due before
+# it's given up on as stale (default: 720 = 12h). Retries during this window
+# survive Matrix outages and bot restarts; past it, the "put them out
+# tonight" message would just be misleading, so it's dropped and logged
+# instead of delivered late.
+# max_lateness_minutes = 720
 
 [security]
 # Users allowed to issue !reset-trust @user:server

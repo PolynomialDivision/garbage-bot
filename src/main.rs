@@ -67,16 +67,27 @@ struct BsrConfig {
 struct ReminderConfig {
     #[serde(default = "default_reminder_time")]
     reminder_time: String,
+    /// How long a reminder keeps retrying after becoming due before it's
+    /// given up on as stale. A reminder says "put them out tonight" — once
+    /// it's this late, that's no longer true, so delivering it would just be
+    /// misleading rather than helpful.
+    #[serde(default = "default_max_lateness_minutes")]
+    max_lateness_minutes: u32,
 }
 
 fn default_reminder_time() -> String {
     "20:00".to_owned()
 }
 
+fn default_max_lateness_minutes() -> u32 {
+    12 * 60 // 12h: e.g. a 20:00 reminder gives up at 08:00 the next morning.
+}
+
 impl Default for ReminderConfig {
     fn default() -> Self {
         Self {
             reminder_time: default_reminder_time(),
+            max_lateness_minutes: default_max_lateness_minutes(),
         }
     }
 }
@@ -323,6 +334,14 @@ struct PendingReminder {
     sent_room_ids: HashSet<String>,
     #[serde(default)]
     attempt: u32,
+    /// When this reminder became due. Compared against `max_lateness` on
+    /// every delivery attempt so a very old, still-unsent reminder is
+    /// eventually given up on instead of retried forever. Defaults to "now"
+    /// when missing (a state file written before this field existed), which
+    /// gives a state-file upgrade a fresh grace period rather than expiring
+    /// an in-flight reminder immediately.
+    #[serde(default = "Local::now")]
+    created_at: DateTime<Local>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -341,6 +360,11 @@ struct PersistedState {
     /// from `last_checked_date` so an empty day never looks like a sent one.
     #[serde(default)]
     last_sent_date: Option<NaiveDate>,
+    /// The most recent date whose reminder was given up on unsent after
+    /// exceeding `max_lateness` — surfaced in `!garbage status` so a silent
+    /// (but deliberate) non-delivery is still visible.
+    #[serde(default)]
+    last_expired_date: Option<NaiveDate>,
     #[serde(default)]
     pending_reminder: Option<PendingReminder>,
 }
@@ -404,6 +428,7 @@ struct BotState {
     waste_labels: HashMap<String, String>,
     waste_colors: HashMap<String, String>,
     reminder_time: NaiveTime,
+    max_lateness: chrono::Duration,
     http: reqwest::Client,
     /// Path to the persisted reminder-state JSON file (not the store
     /// *directory* — see `reminder_state_path` in `main`), on the same
@@ -533,48 +558,58 @@ fn merge_pickup_cache(cache: &[Pickup], fetched: &[Pickup], today: NaiveDate) ->
 /// cache instead of wiping it, and is reflected in that source's `SourceHealth`
 /// for `!garbage status`/`refresh` rather than via an early return that would
 /// have skipped every other source too.
+/// Refresh one source's cache from the outcome of a fetch attempt: on success,
+/// merge the fresh data and reset failure tracking; on failure, merge an empty
+/// fetch (a no-op except pruning past dates — see `merge_pickup_cache`) and
+/// record the error. Shared by BSR and Berlin Recycling so the "never wipe a
+/// known-good schedule" behavior lives in exactly one place.
+fn apply_fetch_outcome(
+    source_name: &str,
+    cache: &[Pickup],
+    outcome: Result<Vec<Pickup>>,
+    health: &mut SourceHealth,
+    today: NaiveDate,
+) -> Vec<Pickup> {
+    match outcome {
+        Ok(fetched) => {
+            info!("{source_name}: {} pickup(s) fetched", fetched.len());
+            health.last_success = Some(Local::now());
+            health.last_error = None;
+            health.consecutive_failures = 0;
+            merge_pickup_cache(cache, &fetched, today)
+        }
+        Err(e) => {
+            error!("{source_name}: schedule refresh failed, keeping previous schedule: {e}");
+            health.last_error = Some(e.to_string());
+            health.consecutive_failures += 1;
+            merge_pickup_cache(cache, &[], today)
+        }
+    }
+}
+
 async fn fetch_all_pickups(state: &BotState) -> Vec<Pickup> {
     let today = Local::now().date_naive();
     let mut persisted = state.persisted.lock().await;
 
-    {
-        let mut health = state.bsr_health.lock().await;
-        match fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await {
-            Ok(fetched) => {
-                info!("BSR: {} pickup(s) fetched", fetched.len());
-                persisted.bsr_cache = merge_pickup_cache(&persisted.bsr_cache, &fetched, today);
-                health.last_success = Some(Local::now());
-                health.last_error = None;
-                health.consecutive_failures = 0;
-            }
-            Err(e) => {
-                error!("BSR: schedule refresh failed, keeping previous schedule: {e}");
-                persisted.bsr_cache = merge_pickup_cache(&persisted.bsr_cache, &[], today);
-                health.last_error = Some(e.to_string());
-                health.consecutive_failures += 1;
-            }
-        }
-    }
-
+    let bsr_outcome = fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await;
+    persisted.bsr_cache = apply_fetch_outcome(
+        "BSR",
+        &persisted.bsr_cache,
+        bsr_outcome,
+        &mut *state.bsr_health.lock().await,
+        today,
+    );
     let mut pickups = persisted.bsr_cache.clone();
 
     if let Some((ref user, ref pass)) = state.berlin_recycling_creds {
-        let mut health = state.br_health.lock().await;
-        match fetch_berlin_recycling_pickups(user, pass, &state.waste_labels).await {
-            Ok(fetched) => {
-                info!("Berlin Recycling: {} pickup(s) fetched", fetched.len());
-                persisted.br_cache = merge_pickup_cache(&persisted.br_cache, &fetched, today);
-                health.last_success = Some(Local::now());
-                health.last_error = None;
-                health.consecutive_failures = 0;
-            }
-            Err(e) => {
-                error!("Berlin Recycling: schedule refresh failed, keeping previous schedule: {e}");
-                persisted.br_cache = merge_pickup_cache(&persisted.br_cache, &[], today);
-                health.last_error = Some(e.to_string());
-                health.consecutive_failures += 1;
-            }
-        }
+        let br_outcome = fetch_berlin_recycling_pickups(user, pass, &state.waste_labels).await;
+        persisted.br_cache = apply_fetch_outcome(
+            "Berlin Recycling",
+            &persisted.br_cache,
+            br_outcome,
+            &mut *state.br_health.lock().await,
+            today,
+        );
         pickups.extend(persisted.br_cache.iter().cloned());
     }
 
@@ -638,6 +673,24 @@ fn next_reminder_datetime<Tz: TimeZone>(now: DateTime<Tz>, target_time: NaiveTim
 fn backoff_delay(attempt: u32) -> Duration {
     let secs = 5u64.saturating_mul(1u64 << attempt.min(6));
     Duration::from_secs(secs.min(300))
+}
+
+/// Whether a pending reminder has been retrying for longer than
+/// `max_lateness` — the bounded counterpart to `backoff_delay`'s unbounded
+/// attempt count. Retries are unlimited *in number* but not in *time*: past
+/// this point the reminder's "put them out tonight" content is actively
+/// wrong, so delivering it would mislead rather than help.
+fn is_pending_expired(
+    pending: &PendingReminder,
+    now: DateTime<Local>,
+    max_lateness: chrono::Duration,
+) -> bool {
+    now.signed_duration_since(pending.created_at) > max_lateness
+}
+
+fn format_duration_minutes(d: chrono::Duration) -> String {
+    let total_minutes = d.num_minutes().max(0);
+    format!("{}h{:02}m", total_minutes / 60, total_minutes % 60)
 }
 
 /// Room IDs (as strings) that still need this reminder sent.
@@ -722,6 +775,23 @@ async fn resolve_pending_reminder(state: &BotState, client: &Client) {
     let Some(mut pending) = pending else {
         return;
     };
+
+    let now = Local::now();
+    if is_pending_expired(&pending, now, state.max_lateness) {
+        error!(
+            "Reminder for {} expired unsent: still pending after {}, {}/{} room(s) confirmed, {} attempt(s) — giving up rather than deliver stale \"put them out tonight\" info",
+            pending.date,
+            format_duration_minutes(now - pending.created_at),
+            pending.sent_room_ids.len(),
+            client.joined_rooms().len(),
+            pending.attempt
+        );
+        let mut persisted = state.persisted.lock().await;
+        persisted.pending_reminder = None;
+        persisted.last_expired_date = Some(pending.date);
+        save_persisted_state(&state.reminder_state_path, &persisted).await;
+        return;
+    }
 
     let rooms = client.joined_rooms();
     let joined_ids: Vec<String> = rooms.iter().map(|r| r.room_id().to_string()).collect();
@@ -816,6 +886,7 @@ async fn maybe_start_reminder(state: &BotState, target_time: NaiveTime) {
             pickups: day_pickups,
             sent_room_ids: HashSet::new(),
             attempt: 0,
+            created_at: now,
         });
     }
     save_persisted_state(&state.reminder_state_path, &persisted).await;
@@ -1061,7 +1132,7 @@ fn describe_source_health(health: &SourceHealth, cached_count: usize) -> String 
 
 /// One-line human summary of the reminder scheduler's current state.
 fn describe_reminder_state(persisted: &PersistedState) -> String {
-    match &persisted.pending_reminder {
+    let base = match &persisted.pending_reminder {
         Some(p) => format!(
             "pending for {} · attempt {} · {} room(s) confirmed",
             p.date,
@@ -1072,6 +1143,10 @@ fn describe_reminder_state(persisted: &PersistedState) -> String {
             Some(d) => format!("last sent {d}"),
             None => "none sent yet".to_owned(),
         },
+    };
+    match persisted.last_expired_date {
+        Some(d) => format!("{base} · ⚠ {d} expired unsent"),
+        None => base,
     }
 }
 
@@ -1256,6 +1331,7 @@ async fn main() -> Result<()> {
         let minute: u32 = parts[1].parse().map_err(|_| invalid())?;
         NaiveTime::from_hms_opt(hour, minute, 0).ok_or_else(invalid)?
     };
+    let max_lateness = chrono::Duration::minutes(config.reminder.max_lateness_minutes as i64);
 
     let store_path =
         PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
@@ -1325,6 +1401,7 @@ async fn main() -> Result<()> {
         waste_labels: config.waste_labels,
         waste_colors: config.waste_colors,
         reminder_time,
+        max_lateness,
         http: reqwest::Client::new(),
         reminder_state_path,
         confirmed: Arc::new(Mutex::new(HashMap::new())),
@@ -2016,11 +2093,16 @@ mod tests {
     // ── Reminder delivery: duplicate prevention across rooms/restarts ────────
 
     fn pending(sent: &[&str], attempt: u32) -> PendingReminder {
+        pending_at(sent, attempt, Local::now())
+    }
+
+    fn pending_at(sent: &[&str], attempt: u32, created_at: DateTime<Local>) -> PendingReminder {
         PendingReminder {
             date: today() + chrono::Duration::days(1),
             pickups: vec![pickup(1, "Organic")],
             sent_room_ids: sent.iter().map(|s| s.to_string()).collect(),
             attempt,
+            created_at,
         }
     }
 
@@ -2090,10 +2172,12 @@ mod tests {
         fs::create_dir_all(&dir).await.unwrap();
         let path = dir.join("reminder_state.json");
 
+        let created_at = Local::now();
         let original = PersistedState {
             bsr_cache: vec![pickup(1, "Organic")],
             last_sent_date: Some(today()),
-            pending_reminder: Some(pending(&["!a:x"], 2)),
+            last_expired_date: Some(today() - chrono::Duration::days(3)),
+            pending_reminder: Some(pending_at(&["!a:x"], 2, created_at)),
             ..Default::default()
         };
 
@@ -2102,10 +2186,116 @@ mod tests {
 
         assert_eq!(loaded.bsr_cache, original.bsr_cache);
         assert_eq!(loaded.last_sent_date, original.last_sent_date);
+        assert_eq!(loaded.last_expired_date, original.last_expired_date);
         let loaded_pending = loaded.pending_reminder.expect("pending reminder");
         assert_eq!(loaded_pending.date, pending(&["!a:x"], 2).date);
         assert_eq!(loaded_pending.attempt, 2);
         assert!(loaded_pending.sent_room_ids.contains("!a:x"));
+        // RFC3339 round-trips to millisecond precision or better.
+        assert!(
+            (loaded_pending.created_at - created_at)
+                .num_milliseconds()
+                .abs()
+                < 1000
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_state_migrates_pre_pending_reminder_fields_format() {
+        // Simulates a state file written before `created_at`/`last_expired_date`
+        // existed. Everything but the new fields must still load correctly.
+        let dir = std::env::temp_dir().join(format!("garbage-bot-test-{}", uuid_ish()));
+        fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("reminder_state.json");
+        let old_format = format!(
+            r#"{{
+                "bsr_cache": [{{"date": "{}", "label": "Residual"}}],
+                "br_cache": [],
+                "last_checked_date": "{}",
+                "last_sent_date": null,
+                "pending_reminder": {{
+                    "date": "{}",
+                    "pickups": [{{"date": "{}", "label": "Residual"}}],
+                    "sent_room_ids": ["!a:x"],
+                    "attempt": 1
+                }}
+            }}"#,
+            today(),
+            today(),
+            today() + chrono::Duration::days(1),
+            today() + chrono::Duration::days(1),
+        );
+        fs::write(&path, old_format).await.unwrap();
+
+        let loaded = load_persisted_state(&path).await;
+        assert_eq!(loaded.bsr_cache.len(), 1);
+        assert_eq!(loaded.last_expired_date, None); // new field, absent -> default
+        let pending = loaded
+            .pending_reminder
+            .expect("pending reminder should load");
+        assert_eq!(pending.attempt, 1);
+        assert!(pending.sent_room_ids.contains("!a:x"));
+        // created_at is new — defaults to "now" rather than failing to parse
+        // or silently expiring an in-flight reminder on the next tick.
+        assert!((Local::now() - pending.created_at).num_seconds().abs() < 5);
+    }
+
+    // ── Reminder lateness cap ─────────────────────────────────────────────────
+
+    #[test]
+    fn is_pending_expired_false_within_max_lateness() {
+        let max_lateness = chrono::Duration::hours(12);
+        let now = Local::now();
+        let p = pending_at(&[], 3, now - chrono::Duration::hours(11));
+        assert!(!is_pending_expired(&p, now, max_lateness));
+    }
+
+    #[test]
+    fn is_pending_expired_true_beyond_max_lateness() {
+        let max_lateness = chrono::Duration::hours(12);
+        let now = Local::now();
+        let p = pending_at(&[], 20, now - chrono::Duration::hours(13));
+        assert!(is_pending_expired(&p, now, max_lateness));
+    }
+
+    #[test]
+    fn is_pending_expired_fresh_reminder_never_expired() {
+        let max_lateness = chrono::Duration::minutes(0); // pathological but valid config
+        let now = Local::now();
+        let p = pending_at(&[], 0, now);
+        assert!(!is_pending_expired(&p, now, max_lateness)); // exactly at the boundary, not over it
+    }
+
+    // ── Source-fetch outcome handling ─────────────────────────────────────────
+
+    #[test]
+    fn apply_fetch_outcome_success_merges_cache_and_clears_health_error() {
+        let mut health = SourceHealth {
+            last_error: Some("previous failure".to_owned()),
+            consecutive_failures: 3,
+            ..Default::default()
+        };
+        let cache = vec![pickup(1, "Organic")];
+        let fetched = Ok(vec![pickup(2, "Paper")]);
+        let merged = apply_fetch_outcome("BSR", &cache, fetched, &mut health, today());
+
+        assert_eq!(merged.len(), 2);
+        assert!(health.last_error.is_none());
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_success.is_some());
+    }
+
+    #[test]
+    fn apply_fetch_outcome_failure_preserves_cache_and_records_error() {
+        let mut health = SourceHealth::default();
+        let cache = vec![pickup(1, "Organic"), pickup(2, "Paper")];
+        let fetched: Result<Vec<Pickup>> = Err(anyhow!("dns error"));
+        let merged = apply_fetch_outcome("BSR", &cache, fetched, &mut health, today());
+
+        assert_eq!(merged, cache); // known-good schedule untouched
+        assert_eq!(health.last_error.as_deref(), Some("dns error"));
+        assert_eq!(health.consecutive_failures, 1);
+        assert!(health.last_success.is_none());
     }
 
     fn uuid_ish() -> u128 {
