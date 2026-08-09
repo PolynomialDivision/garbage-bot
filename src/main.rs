@@ -494,31 +494,45 @@ fn build_reminder(
     pickup_date: NaiveDate,
     colors: &HashMap<String, String>,
 ) -> (String, String) {
-    let day = pickup_date.format("%A, %d.%m.%Y").to_string();
+    let day = pickup_date.format("%A, %-d %b").to_string();
+    let day_pickups: Vec<&Pickup> = pickups
+        .iter()
+        .filter(|pickup| pickup.date == pickup_date)
+        .collect();
 
-    let plain_bins: String = pickups
+    let plain_bins = day_pickups
         .iter()
-        .map(|p| {
-            let dot = colors.get(&p.label).map(|c| hex_to_dot(c)).unwrap_or("🗑️");
-            format!("{dot} {}\n", p.label)
+        .map(|pickup| {
+            let dot = colors
+                .get(&pickup.label)
+                .map(|color| hex_to_dot(color))
+                .unwrap_or("🗑️");
+            format!("{dot} {}", pickup.label)
         })
-        .collect();
-    let html_bins: String = pickups
+        .collect::<Vec<_>>()
+        .join("\n");
+    let html_bins = day_pickups
         .iter()
-        .map(|p| match colors.get(&p.label) {
-            Some(color) => format!(
-                "🗑️ <font data-mx-color=\"{color}\"><strong>{}</strong></font><br>",
-                p.label
-            ),
-            None => format!("🗑️ <strong>{}</strong><br>", p.label),
+        .map(|pickup| {
+            let dot = colors
+                .get(&pickup.label)
+                .map(|color| hex_to_dot(color))
+                .unwrap_or("🗑️");
+            format!("{dot} {}", escape_html(&pickup.label))
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .join("<br>");
+    let bin_word = if day_pickups.len() == 1 {
+        "bin"
+    } else {
+        "bins"
+    };
 
     let plain = format!(
-        "@room\n🗑️ Tomorrow ({day}):\n{plain_bins}Put them out tonight · click ✅ when done"
+        "📢 Garbage reminder for tomorrow\n{day}\n\n{plain_bins}\n\n@room · Put the {bin_word} out tonight · ✅ when done"
     );
     let html = format!(
-        "@room<br>🗑️ Tomorrow <b>{day}</b>:<br>{html_bins}Put them out tonight · click ✅ when done"
+        "📢 <strong>Garbage reminder for tomorrow</strong><br><strong>{day}</strong><br><br>{html_bins}<br><br>@room · Put the {bin_word} out tonight · ✅ when done"
     );
     (plain, html)
 }
@@ -1645,6 +1659,15 @@ mod tests {
         ])
     }
 
+    fn reminder_colors() -> HashMap<String, String> {
+        HashMap::from([
+            ("Residual Waste (grey)".to_owned(), "#808080".to_owned()),
+            ("Organic Waste (brown)".to_owned(), "#8B4513".to_owned()),
+            ("Paper (blue)".to_owned(), "#4682B4".to_owned()),
+            ("Recyclables (yellow)".to_owned(), "#DAA520".to_owned()),
+        ])
+    }
+
     fn pickup(days_from_today: i64, label: &str) -> Pickup {
         Pickup {
             date: today() + chrono::Duration::days(days_from_today),
@@ -1819,6 +1842,63 @@ mod tests {
     }
 
     // ── Compact Matrix output ─────────────────────────────────────────────────
+
+    #[test]
+    fn single_bin_reminder_uses_singular_wording_and_only_that_days_pickup() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let pickups = vec![
+            Pickup {
+                date,
+                label: "Residual Waste (grey)".to_owned(),
+            },
+            Pickup {
+                date: date + chrono::Duration::days(1),
+                label: "Paper (blue)".to_owned(),
+            },
+        ];
+
+        let (plain, html) = build_reminder(&pickups, date, &reminder_colors());
+
+        assert_eq!(
+            plain,
+            "📢 Garbage reminder for tomorrow\nMonday, 10 Aug\n\n⚫ Residual Waste (grey)\n\n@room · Put the bin out tonight · ✅ when done"
+        );
+        assert_eq!(
+            html,
+            "📢 <strong>Garbage reminder for tomorrow</strong><br><strong>Monday, 10 Aug</strong><br><br>⚫ Residual Waste (grey)<br><br>@room · Put the bin out tonight · ✅ when done"
+        );
+        assert!(!plain.contains("Paper"));
+    }
+
+    #[test]
+    fn multi_bin_reminder_lists_each_due_type_with_plural_wording() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let pickups = vec![
+            Pickup {
+                date,
+                label: "Residual Waste (grey)".to_owned(),
+            },
+            Pickup {
+                date,
+                label: "Organic Waste (brown)".to_owned(),
+            },
+            Pickup {
+                date,
+                label: "Paper (blue)".to_owned(),
+            },
+        ];
+
+        let (plain, html) = build_reminder(&pickups, date, &reminder_colors());
+
+        assert_eq!(
+            plain,
+            "📢 Garbage reminder for tomorrow\nMonday, 10 Aug\n\n⚫ Residual Waste (grey)\n🟤 Organic Waste (brown)\n🔵 Paper (blue)\n\n@room · Put the bins out tonight · ✅ when done"
+        );
+        assert!(html
+            .contains("⚫ Residual Waste (grey)<br>🟤 Organic Waste (brown)<br>🔵 Paper (blue)"));
+        assert!(html.ends_with("@room · Put the bins out tonight · ✅ when done"));
+        assert!(!plain.contains("🗑️"));
+    }
 
     #[test]
     fn render_is_compact_one_line_per_entry_no_table() {
