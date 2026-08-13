@@ -33,14 +33,14 @@ COPY --from=planner /build/recipe.json recipe.json
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=shared-sccache,target=/sccache \
-    --mount=type=cache,id=garbagecollectorreminder-target,target=/build/target \
+    --mount=type=cache,id=garbage-bot-target,target=/build/target \
     cargo chef cook --release --recipe-path recipe.json
 
 COPY . .
 RUN --mount=type=cache,id=shared-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=shared-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=shared-sccache,target=/sccache \
-    --mount=type=cache,id=garbagecollectorreminder-target,target=/build/target \
+    --mount=type=cache,id=garbage-bot-target,target=/build/target \
     cargo build --release && \
     cp target/release/garbage-bot /garbage-bot
 
