@@ -1,12 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveTime, TimeZone};
+use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone};
+use chrono_tz::Tz;
+use futures_util::FutureExt;
 use matrix_sdk::{
     config::SyncSettings,
     ruma::{
@@ -20,7 +23,7 @@ use matrix_sdk::{
             },
             Mentions,
         },
-        OwnedEventId, OwnedServerName, OwnedUserId, RoomOrAliasId,
+        OwnedEventId, OwnedServerName, OwnedTransactionId, OwnedUserId, RoomOrAliasId,
     },
     Client, Room, RoomState,
 };
@@ -30,6 +33,19 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs, sync::Mutex, time::sleep};
 use tracing::{error, info, warn};
 use url::Url;
+
+/// Garbage collection dates and reminder wall-clock times are local Berlin
+/// times. Do not use `chrono::Local`: containers frequently retain an UTC
+/// `/etc/localtime` even when a `TZ` environment variable is present.
+const REMINDER_TZ: Tz = chrono_tz::Europe::Berlin;
+
+fn reminder_now() -> DateTime<Tz> {
+    chrono::Utc::now().with_timezone(&REMINDER_TZ)
+}
+
+fn reminder_now_utc() -> DateTime<chrono::Utc> {
+    reminder_now().to_utc()
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -187,7 +203,7 @@ async fn fetch_pickups(
     schedule_id: &str,
     waste_labels: &HashMap<String, String>,
 ) -> Result<Vec<Pickup>> {
-    let now = Local::now();
+    let now = reminder_now();
     let filter = format!(
         "AddrKey eq '{}' and DateFrom eq datetime'{}-{:02}-01T00:00:00' and DateTo eq datetime'{}-{:02}-01T00:00:00'",
         schedule_id,
@@ -340,8 +356,8 @@ struct PendingReminder {
     /// when missing (a state file written before this field existed), which
     /// gives a state-file upgrade a fresh grace period rather than expiring
     /// an in-flight reminder immediately.
-    #[serde(default = "Local::now")]
-    created_at: DateTime<Local>,
+    #[serde(default = "reminder_now_utc")]
+    created_at: DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -374,7 +390,14 @@ async fn load_persisted_state(path: &Path) -> PersistedState {
         Ok(s) => match serde_json::from_str(&s) {
             Ok(state) => state,
             Err(e) => {
-                error!("Reminder state file at {path:?} is corrupt ({e}) — starting fresh. Previously-cached schedules and any pending reminder are lost.");
+                let backup = path.with_file_name(format!(
+                    "reminder_state.corrupt-{}.json",
+                    chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+                ));
+                match fs::rename(path, &backup).await {
+                    Ok(()) => error!("Reminder state file at {path:?} is corrupt ({e}); moved it to {backup:?} and starting with empty state"),
+                    Err(rename_error) => error!("Reminder state file at {path:?} is corrupt ({e}); failed to preserve it at {backup:?}: {rename_error}. Starting with empty state"),
+                }
                 PersistedState::default()
             }
         },
@@ -394,6 +417,12 @@ async fn save_persisted_state(path: &Path, state: &PersistedState) {
             return;
         }
     };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent).await {
+            error!("Failed to create reminder-state directory {parent:?}: {e}");
+            return;
+        }
+    }
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = fs::write(&tmp, &json).await {
         error!("Failed to write reminder state tmp file at {tmp:?}: {e}");
@@ -410,7 +439,7 @@ async fn save_persisted_state(path: &Path, state: &PersistedState) {
 /// what actually needs that guarantee).
 #[derive(Debug, Clone, Default)]
 struct SourceHealth {
-    last_success: Option<DateTime<Local>>,
+    last_success: Option<DateTime<Tz>>,
     last_error: Option<String>,
     consecutive_failures: u32,
 }
@@ -587,7 +616,7 @@ fn apply_fetch_outcome(
     match outcome {
         Ok(fetched) => {
             info!("{source_name}: {} pickup(s) fetched", fetched.len());
-            health.last_success = Some(Local::now());
+            health.last_success = Some(reminder_now());
             health.last_error = None;
             health.consecutive_failures = 0;
             merge_pickup_cache(cache, &fetched, today)
@@ -602,7 +631,7 @@ fn apply_fetch_outcome(
 }
 
 async fn fetch_all_pickups(state: &BotState) -> Vec<Pickup> {
-    let today = Local::now().date_naive();
+    let today = reminder_now().date_naive();
     let mut persisted = state.persisted.lock().await;
 
     let bsr_outcome = fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await;
@@ -689,6 +718,28 @@ fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_secs(secs.min(300))
 }
 
+fn reconnect_backoff_delay(attempt: u32) -> Duration {
+    let secs = 5u64.saturating_mul(1u64 << attempt.min(6));
+    Duration::from_secs(secs.min(300))
+}
+
+/// Matrix handlers run independently from the sync loop. Do not let a panic
+/// in one disappear silently while the process otherwise stays healthy.
+fn spawn_logged<F>(name: &'static str, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if std::panic::AssertUnwindSafe(future)
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            error!(task = name, "Background task panicked");
+        }
+    });
+}
+
 /// Whether a pending reminder has been retrying for longer than
 /// `max_lateness` — the bounded counterpart to `backoff_delay`'s unbounded
 /// attempt count. Retries are unlimited *in number* but not in *time*: past
@@ -696,10 +747,11 @@ fn backoff_delay(attempt: u32) -> Duration {
 /// wrong, so delivering it would mislead rather than help.
 fn is_pending_expired(
     pending: &PendingReminder,
-    now: DateTime<Local>,
+    now: DateTime<Tz>,
     max_lateness: chrono::Duration,
 ) -> bool {
-    now.signed_duration_since(pending.created_at) > max_lateness
+    now.date_naive() >= pending.date
+        || now.to_utc().signed_duration_since(pending.created_at) > max_lateness
 }
 
 fn format_duration_minutes(d: chrono::Duration) -> String {
@@ -733,17 +785,29 @@ fn should_start_new_reminder(
     now_date: NaiveDate,
     now_time: NaiveTime,
     target_time: NaiveTime,
-    last_checked_date: Option<NaiveDate>,
+    last_sent_date: Option<NaiveDate>,
     has_pending: bool,
 ) -> Option<NaiveDate> {
     if has_pending || now_time < target_time {
         return None;
     }
     let target_date = now_date + chrono::Duration::days(1);
-    if last_checked_date == Some(target_date) {
+    if last_sent_date == Some(target_date) {
         return None;
     }
     Some(target_date)
+}
+
+fn reminder_transaction_id(pending: &PendingReminder, room_id: &str) -> OwnedTransactionId {
+    let mut labels: Vec<&str> = pending.pickups.iter().map(|p| p.label.as_str()).collect();
+    labels.sort_unstable();
+    format!(
+        "garbage-reminder-{}-{}-{}",
+        pending.date,
+        room_id,
+        labels.join("-")
+    )
+    .into()
 }
 
 /// Send `plain`/`html` to one room, track it for ✅ confirmations, and seed a
@@ -755,12 +819,20 @@ async fn deliver_reminder_to_room(
     room: &Room,
     plain: &str,
     html: &str,
+    transaction_id: Option<OwnedTransactionId>,
 ) -> matrix_sdk::Result<OwnedEventId> {
     let mut content = RoomMessageEventContent::text_html(plain.to_owned(), html.to_owned());
     let mut mentions = Mentions::new();
     mentions.room = true;
     content = content.add_mentions(mentions);
-    let resp = room.send(content).await?;
+    let resp = match transaction_id {
+        Some(transaction_id) => {
+            room.send(content)
+                .with_transaction_id(transaction_id)
+                .await?
+        }
+        None => room.send(content).await?,
+    };
     let event_id = resp.response.event_id;
 
     state
@@ -790,12 +862,12 @@ async fn resolve_pending_reminder(state: &BotState, client: &Client) {
         return;
     };
 
-    let now = Local::now();
+    let now = reminder_now();
     if is_pending_expired(&pending, now, state.max_lateness) {
         error!(
             "Reminder for {} expired unsent: still pending after {}, {}/{} room(s) confirmed, {} attempt(s) — giving up rather than deliver stale \"put them out tonight\" info",
             pending.date,
-            format_duration_minutes(now - pending.created_at),
+            format_duration_minutes(now.to_utc() - pending.created_at),
             pending.sent_room_ids.len(),
             client.joined_rooms().len(),
             pending.attempt
@@ -825,7 +897,8 @@ async fn resolve_pending_reminder(state: &BotState, client: &Client) {
         if !targets.contains(&room_id) {
             continue;
         }
-        match deliver_reminder_to_room(state, room, &plain, &html).await {
+        let transaction_id = reminder_transaction_id(&pending, &room_id);
+        match deliver_reminder_to_room(state, room, &plain, &html, Some(transaction_id)).await {
             Ok(event_id) => {
                 info!(
                     "Reminder delivered: room={room_id} date={} event_id={event_id}",
@@ -865,21 +938,33 @@ async fn resolve_pending_reminder(state: &BotState, client: &Client) {
 /// recoverable record on restart. `resolve_pending_reminder` does the actual
 /// sending, whether called right after this or on a later retry/restart.
 async fn maybe_start_reminder(state: &BotState, target_time: NaiveTime) {
-    let now = Local::now();
-    let (last_checked_date, has_pending) = {
+    let now = reminder_now();
+    let (last_checked_date, last_sent_date, has_pending) = {
         let persisted = state.persisted.lock().await;
         (
             persisted.last_checked_date,
+            persisted.last_sent_date,
             persisted.pending_reminder.is_some(),
         )
     };
-    let Some(target_date) = should_start_new_reminder(
+    let decision = should_start_new_reminder(
         now.date_naive(),
         now.time(),
         target_time,
-        last_checked_date,
+        last_sent_date,
         has_pending,
-    ) else {
+    );
+    info!(
+        now = %now.to_rfc3339(),
+        timezone = %REMINDER_TZ,
+        reminder_time = %target_time.format("%H:%M"),
+        last_checked = ?last_checked_date,
+        last_sent = ?last_sent_date,
+        pending = has_pending,
+        target_date = ?decision,
+        "Reminder scheduler tick"
+    );
+    let Some(target_date) = decision else {
         return;
     };
 
@@ -900,7 +985,7 @@ async fn maybe_start_reminder(state: &BotState, target_time: NaiveTime) {
             pickups: day_pickups,
             sent_room_ids: HashSet::new(),
             attempt: 0,
-            created_at: now,
+            created_at: now.to_utc(),
         });
     }
     save_persisted_state(&state.reminder_state_path, &persisted).await;
@@ -908,6 +993,15 @@ async fn maybe_start_reminder(state: &BotState, target_time: NaiveTime) {
 
 async fn run_scheduler(state: BotState, client: Client) {
     let target_time = state.reminder_time;
+    let now = reminder_now();
+    let next = next_reminder_datetime(now, target_time);
+    info!(
+        timezone = %REMINDER_TZ,
+        reminder_time = %target_time.format("%H:%M"),
+        now = %now.to_rfc3339(),
+        next = %next.to_rfc3339(),
+        "Reminder scheduler started"
+    );
     loop {
         // Order matters: create today's pending reminder first (if due), then
         // attempt delivery in the same tick — a freshly-created reminder
@@ -922,12 +1016,16 @@ async fn run_scheduler(state: BotState, client: Client) {
         let sleep_dur = match pending_attempt {
             Some(attempt) => backoff_delay(attempt),
             None => {
-                let now = Local::now();
+                let now = reminder_now();
                 let target_dt = next_reminder_datetime(now, target_time);
                 Duration::from_secs((target_dt - now).num_seconds().max(1) as u64)
+                    .min(Duration::from_secs(15 * 60))
             }
         };
+        let next_wake = reminder_now()
+            + chrono::Duration::seconds(sleep_dur.as_secs().min(i64::MAX as u64) as i64);
         info!(
+            next = %next_wake.to_rfc3339(),
             "Scheduler sleeping {}s (pending={})",
             sleep_dur.as_secs(),
             pending_attempt.is_some()
@@ -943,7 +1041,7 @@ async fn run_scheduler(state: BotState, client: Client) {
 /// sent".
 async fn send_test_reminder(state: &BotState, client: &Client) {
     let pickups = fetch_all_pickups(state).await;
-    let today = Local::now().date_naive();
+    let today = reminder_now().date_naive();
     let Some(next_date) = pickups
         .iter()
         .filter(|p| p.date >= today)
@@ -973,7 +1071,7 @@ async fn send_test_reminder(state: &BotState, client: &Client) {
 
     let (plain, html) = build_reminder(&day_pickups, next_date, &state.waste_colors);
     for room in rooms {
-        match deliver_reminder_to_room(state, &room, &plain, &html).await {
+        match deliver_reminder_to_room(state, &room, &plain, &html, None).await {
             Ok(event_id) => info!(
                 "Sent test reminder to {}, event_id={}",
                 room.room_id(),
@@ -1271,7 +1369,7 @@ async fn handle_garbage_command(
         }
         GarbageCommand::NextPerType | GarbageCommand::NextEvent | GarbageCommand::Week => {
             let pickups = dedup_pickups(fetch_all_pickups(&state).await);
-            let today = Local::now().date_naive();
+            let today = reminder_now().date_naive();
             build_garbage_reply(cmd, &pickups, today, &state.waste_colors)
         }
     };
@@ -1454,7 +1552,7 @@ async fn main() -> Result<()> {
                         return;
                     }
                 };
-                tokio::spawn(async move {
+                spawn_logged("join-invited-room", async move {
                     let mut delay = 2u64;
                     const MAX_ATTEMPTS: u32 = 8;
                     for attempt in 1..=MAX_ATTEMPTS {
@@ -1509,12 +1607,10 @@ async fn main() -> Result<()> {
                     return;
                 }
                 if let Some(cmd) = parse_garbage_command(raw) {
-                    tokio::spawn(handle_garbage_command(
-                        state.clone(),
-                        room,
-                        cmd,
-                        ev.sender.clone(),
-                    ));
+                    spawn_logged(
+                        "garbage-command",
+                        handle_garbage_command(state.clone(), room, cmd, ev.sender.clone()),
+                    );
                 }
             }
         }
@@ -1529,13 +1625,13 @@ async fn main() -> Result<()> {
                 if room.state() != RoomState::Joined {
                     return;
                 }
-                tokio::spawn(handle_reaction(state, room, ev));
+                spawn_logged("reaction-handler", handle_reaction(state, room, ev));
             }
         }
     });
 
     // Scheduler
-    tokio::spawn({
+    spawn_logged("reminder-scheduler", {
         let state = state.clone();
         let client = client.clone();
         async move {
@@ -1549,11 +1645,34 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("Starting sync...");
+    info!("Starting Matrix sync...");
     let filter = FilterDefinition::with_lazy_loading();
-    client
-        .sync_once(SyncSettings::default().filter(filter.clone().into()))
-        .await?;
+    let mut initial_sync_attempt = 0u32;
+    loop {
+        match client
+            .sync_once(SyncSettings::default().filter(filter.clone().into()))
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    attempt = initial_sync_attempt + 1,
+                    "Initial Matrix sync completed"
+                );
+                break;
+            }
+            Err(e) => {
+                let delay = reconnect_backoff_delay(initial_sync_attempt);
+                initial_sync_attempt = initial_sync_attempt.saturating_add(1);
+                warn!(
+                    attempt = initial_sync_attempt,
+                    retry_in_secs = delay.as_secs(),
+                    error = %e,
+                    "Initial Matrix sync failed; retrying without terminating scheduler"
+                );
+                sleep(delay).await;
+            }
+        }
+    }
 
     // Drain pending invites from prior sessions.
     let invited = client.invited_rooms();
@@ -1580,15 +1699,23 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut sync_attempt = 0u32;
     loop {
         match client
             .sync(SyncSettings::default().filter(filter.clone().into()))
             .await
         {
-            Ok(()) => warn!("Sync loop exited cleanly — reconnecting"),
-            Err(e) => warn!("Sync loop error: {e} — reconnecting in 5s"),
+            Ok(()) => warn!("Matrix sync loop exited cleanly; reconnecting"),
+            Err(e) => warn!(error = %e, "Matrix sync loop failed; reconnecting"),
         }
-        sleep(Duration::from_secs(5)).await;
+        let delay = reconnect_backoff_delay(sync_attempt);
+        sync_attempt = sync_attempt.saturating_add(1);
+        warn!(
+            attempt = sync_attempt,
+            retry_in_secs = delay.as_secs(),
+            "Waiting before Matrix sync reconnect"
+        );
+        sleep(delay).await;
     }
 }
 
@@ -1648,6 +1775,11 @@ mod tests {
 
     fn today() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 7, 20).unwrap() // fixed: a Monday
+    }
+
+    #[test]
+    fn reminder_clock_is_explicitly_berlin_not_container_localtime() {
+        assert_eq!(reminder_now().timezone(), chrono_tz::Europe::Berlin);
     }
 
     fn colors() -> HashMap<String, String> {
@@ -2125,6 +2257,14 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_backoff_is_bounded_exponential() {
+        assert_eq!(reconnect_backoff_delay(0), Duration::from_secs(5));
+        assert_eq!(reconnect_backoff_delay(1), Duration::from_secs(10));
+        assert_eq!(reconnect_backoff_delay(2), Duration::from_secs(20));
+        assert_eq!(reconnect_backoff_delay(99), Duration::from_secs(300));
+    }
+
+    #[test]
     fn should_not_start_before_target_time() {
         let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
         let now_time = NaiveTime::from_hms_opt(19, 59, 59).unwrap();
@@ -2142,6 +2282,38 @@ mod tests {
     }
 
     #[test]
+    fn restart_before_reminder_time_waits_without_creating_pending_reminder() {
+        let target = NaiveTime::from_hms_opt(18, 0, 0).unwrap();
+        let before = NaiveTime::from_hms_opt(17, 30, 0).unwrap();
+        assert_eq!(
+            should_start_new_reminder(today(), before, target, None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn restart_late_on_previous_day_creates_missing_tomorrow_reminder() {
+        let target = NaiveTime::from_hms_opt(18, 0, 0).unwrap();
+        let late = NaiveTime::from_hms_opt(22, 0, 0).unwrap();
+        assert_eq!(
+            should_start_new_reminder(today(), late, target, None, false),
+            Some(today() + chrono::Duration::days(1))
+        );
+    }
+
+    #[test]
+    fn checked_but_unsent_reminder_is_reconciled_after_restart() {
+        // `last_checked_date` deliberately is not an input: a transient empty
+        // schedule result must never suppress a later successful reconciliation.
+        let target = NaiveTime::from_hms_opt(18, 0, 0).unwrap();
+        let late = NaiveTime::from_hms_opt(22, 0, 0).unwrap();
+        assert_eq!(
+            should_start_new_reminder(today(), late, target, None, false),
+            Some(today() + chrono::Duration::days(1))
+        );
+    }
+
+    #[test]
     fn should_not_start_a_second_pending_reminder() {
         let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
         assert_eq!(
@@ -2151,7 +2323,7 @@ mod tests {
     }
 
     #[test]
-    fn should_not_restart_a_reminder_already_checked_today() {
+    fn should_not_restart_a_reminder_already_delivered_today() {
         let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
         let tomorrow = today() + chrono::Duration::days(1);
         assert_eq!(
@@ -2162,7 +2334,7 @@ mod tests {
 
     #[test]
     fn should_start_again_once_the_date_rolls_over() {
-        // last_checked_date is yesterday's target — a new day means a new check.
+        // Yesterday's delivery must not suppress today's different target date.
         let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
         let stale_checked_date = today(); // was "tomorrow" relative to yesterday
         let result =
@@ -2173,10 +2345,14 @@ mod tests {
     // ── Reminder delivery: duplicate prevention across rooms/restarts ────────
 
     fn pending(sent: &[&str], attempt: u32) -> PendingReminder {
-        pending_at(sent, attempt, Local::now())
+        pending_at(sent, attempt, reminder_now_utc())
     }
 
-    fn pending_at(sent: &[&str], attempt: u32, created_at: DateTime<Local>) -> PendingReminder {
+    fn pending_at(
+        sent: &[&str],
+        attempt: u32,
+        created_at: DateTime<chrono::Utc>,
+    ) -> PendingReminder {
         PendingReminder {
             date: today() + chrono::Duration::days(1),
             pickups: vec![pickup(1, "Organic")],
@@ -2198,6 +2374,19 @@ mod tests {
         let p = pending(&["!a:x", "!b:x"], 2);
         let joined = vec!["!a:x".to_owned(), "!b:x".to_owned()];
         assert!(rooms_pending_delivery(&p, &joined).is_empty());
+    }
+
+    #[test]
+    fn reminder_transaction_id_is_stable_per_date_pickups_and_room() {
+        let p = pending(&[], 0);
+        assert_eq!(
+            reminder_transaction_id(&p, "!room:example.org"),
+            reminder_transaction_id(&p, "!room:example.org")
+        );
+        assert_ne!(
+            reminder_transaction_id(&p, "!room:example.org"),
+            reminder_transaction_id(&p, "!other:example.org")
+        );
     }
 
     #[test]
@@ -2244,6 +2433,16 @@ mod tests {
         let state = load_persisted_state(&path).await;
         assert!(state.bsr_cache.is_empty());
         assert!(state.pending_reminder.is_none());
+        assert!(
+            !path.exists(),
+            "corrupt file must not be overwritten in place"
+        );
+        let mut entries = fs::read_dir(&dir).await.unwrap();
+        let backup = entries.next_entry().await.unwrap().unwrap();
+        assert!(backup
+            .file_name()
+            .to_string_lossy()
+            .starts_with("reminder_state.corrupt-"));
     }
 
     #[tokio::test]
@@ -2252,7 +2451,7 @@ mod tests {
         fs::create_dir_all(&dir).await.unwrap();
         let path = dir.join("reminder_state.json");
 
-        let created_at = Local::now();
+        let created_at = reminder_now_utc();
         let original = PersistedState {
             bsr_cache: vec![pickup(1, "Organic")],
             last_sent_date: Some(today()),
@@ -2317,7 +2516,12 @@ mod tests {
         assert!(pending.sent_room_ids.contains("!a:x"));
         // created_at is new — defaults to "now" rather than failing to parse
         // or silently expiring an in-flight reminder on the next tick.
-        assert!((Local::now() - pending.created_at).num_seconds().abs() < 5);
+        assert!(
+            (reminder_now_utc() - pending.created_at)
+                .num_seconds()
+                .abs()
+                < 5
+        );
     }
 
     // ── Reminder lateness cap ─────────────────────────────────────────────────
@@ -2325,25 +2529,36 @@ mod tests {
     #[test]
     fn is_pending_expired_false_within_max_lateness() {
         let max_lateness = chrono::Duration::hours(12);
-        let now = Local::now();
-        let p = pending_at(&[], 3, now - chrono::Duration::hours(11));
+        let now = reminder_now();
+        let mut p = pending_at(&[], 3, now.to_utc() - chrono::Duration::hours(11));
+        p.date = now.date_naive() + chrono::Duration::days(1);
         assert!(!is_pending_expired(&p, now, max_lateness));
     }
 
     #[test]
     fn is_pending_expired_true_beyond_max_lateness() {
         let max_lateness = chrono::Duration::hours(12);
-        let now = Local::now();
-        let p = pending_at(&[], 20, now - chrono::Duration::hours(13));
+        let now = reminder_now();
+        let mut p = pending_at(&[], 20, now.to_utc() - chrono::Duration::hours(13));
+        p.date = now.date_naive() + chrono::Duration::days(1);
         assert!(is_pending_expired(&p, now, max_lateness));
     }
 
     #[test]
     fn is_pending_expired_fresh_reminder_never_expired() {
         let max_lateness = chrono::Duration::minutes(0); // pathological but valid config
-        let now = Local::now();
-        let p = pending_at(&[], 0, now);
+        let now = reminder_now();
+        let mut p = pending_at(&[], 0, now.to_utc());
+        p.date = now.date_naive() + chrono::Duration::days(1);
         assert!(!is_pending_expired(&p, now, max_lateness)); // exactly at the boundary, not over it
+    }
+
+    #[test]
+    fn pending_reminder_expires_at_start_of_collection_day() {
+        let now = reminder_now();
+        let mut p = pending_at(&[], 0, now.to_utc());
+        p.date = now.date_naive();
+        assert!(is_pending_expired(&p, now, chrono::Duration::hours(24)));
     }
 
     // ── Source-fetch outcome handling ─────────────────────────────────────────

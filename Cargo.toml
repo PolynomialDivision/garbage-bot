@@ -20,13 +20,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 url = "2"
 mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
 
 [dev-dependencies]
 # IANA tzdata, used only in tests to deterministically exercise DST gap/overlap
 # handling without depending on the host machine's configured timezone.
-chrono-tz = "0.10"
 
 [patch.crates-io]
 matrix-sdk        = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
