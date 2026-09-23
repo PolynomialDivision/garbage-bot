@@ -8,8 +8,8 @@ name = "garbage-bot"
 path = "src/main.rs"
 
 [dependencies]
-matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
-matrix-sdk-crypto = "0.18"
+matrix-sdk = { version = "0.19.1", features = ["e2e-encryption", "sqlite", "automatic-room-key-forwarding"] }
+matrix-sdk-crypto = "0.19.1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,8 +29,8 @@ mxbot-common = { git = "https://github.com/PolynomialDivision/mxbot-common" }
 # handling without depending on the host machine's configured timezone.
 
 [patch.crates-io]
-matrix-sdk        = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
-matrix-sdk-base   = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
-matrix-sdk-common = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
-matrix-sdk-crypto = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
-matrix-sdk-sqlite = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted" }
+matrix-sdk        = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
+matrix-sdk-base   = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
+matrix-sdk-common = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
+matrix-sdk-crypto = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
+matrix-sdk-sqlite = { git = "https://github.com/PolynomialDivision/matrix-rust-sdk", branch = "msc3952-mentions-encrypted-0.19" }
