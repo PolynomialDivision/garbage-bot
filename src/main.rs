@@ -1527,7 +1527,7 @@ async fn main() -> Result<()> {
 
     info!("Starting Matrix sync...");
     bot.initial_sync().await;
-    bot.sync_forever().await
+    bot.run().await
 }
 
 // ── Reaction handler ──────────────────────────────────────────────────────────
