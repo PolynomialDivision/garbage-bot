@@ -10,25 +10,28 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone};
 use chrono_tz::Tz;
 use futures_util::FutureExt;
-use matrix_sdk::{
-    config::SyncSettings,
-    ruma::{
-        api::client::filter::FilterDefinition,
-        events::{
-            reaction::{OriginalSyncReactionEvent, ReactionEventContent},
-            relation::Annotation,
-            room::{
-                member::StrippedRoomMemberEvent,
-                message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
+use mxbot_common::{
+    admin::Dispatch,
+    config::{MatrixConfig, SecurityConfig, TimeOfDay},
+    matrix_sdk::{
+        self,
+        deserialized_responses::EncryptionInfo,
+        ruma::{
+            events::{
+                reaction::{OriginalSyncReactionEvent, ReactionEventContent},
+                relation::Annotation,
+                room::message::{
+                    MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+                },
+                Mentions,
             },
-            Mentions,
+            OwnedEventId, OwnedTransactionId, OwnedUserId,
         },
-        OwnedEventId, OwnedServerName, OwnedTransactionId, OwnedUserId, RoomOrAliasId,
+        Room, RoomState,
     },
-    Client, Room, RoomState,
+    settings::Settings,
+    Bot,
 };
-use mxbot_common::config::{MatrixConfig, SecurityConfig};
-use mxbot_common::verify::VerificationService;
 use serde::{Deserialize, Serialize};
 use tokio::{fs, sync::Mutex, time::sleep};
 use tracing::{error, info, warn};
@@ -82,7 +85,7 @@ struct BsrConfig {
 #[derive(Deserialize)]
 struct ReminderConfig {
     #[serde(default = "default_reminder_time")]
-    reminder_time: String,
+    reminder_time: TimeOfDay,
     /// How long a reminder keeps retrying after becoming due before it's
     /// given up on as stale. A reminder says "put them out tonight" — once
     /// it's this late, that's no longer true, so delivering it would just be
@@ -91,8 +94,8 @@ struct ReminderConfig {
     max_lateness_minutes: u32,
 }
 
-fn default_reminder_time() -> String {
-    "20:00".to_owned()
+fn default_reminder_time() -> TimeOfDay {
+    TimeOfDay::new(20, 0)
 }
 
 fn default_max_lateness_minutes() -> u32 {
@@ -410,26 +413,8 @@ async fn load_persisted_state(path: &Path) -> PersistedState {
 }
 
 async fn save_persisted_state(path: &Path, state: &PersistedState) {
-    let json = match serde_json::to_string_pretty(state) {
-        Ok(j) => j,
-        Err(e) => {
-            error!("Failed to serialize reminder state: {e}");
-            return;
-        }
-    };
-    if let Some(parent) = path.parent() {
-        if let Err(e) = fs::create_dir_all(parent).await {
-            error!("Failed to create reminder-state directory {parent:?}: {e}");
-            return;
-        }
-    }
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = fs::write(&tmp, &json).await {
-        error!("Failed to write reminder state tmp file at {tmp:?}: {e}");
-        return;
-    }
-    if let Err(e) = fs::rename(&tmp, path).await {
-        error!("Failed to persist reminder state to {path:?}: {e}");
+    if let Err(e) = mxbot_common::persist::save_json_atomic(path, state).await {
+        error!("Failed to persist reminder state to {path:?}: {e:#}");
     }
 }
 
@@ -448,16 +433,13 @@ struct SourceHealth {
 
 #[derive(Clone)]
 struct BotState {
-    bot_user_id: OwnedUserId,
-    admin_users: HashSet<OwnedUserId>,
-    allowed_inviters: HashSet<OwnedUserId>,
-    verification: VerificationService,
+    bot: Bot,
     bsr_schedule_id: String,
     berlin_recycling_creds: Option<(String, String)>,
     waste_labels: HashMap<String, String>,
     waste_colors: HashMap<String, String>,
-    reminder_time: NaiveTime,
-    max_lateness: chrono::Duration,
+    /// Reminder time and lateness, adjustable with `!admin set`.
+    settings: Settings<ReminderSettings>,
     http: reqwest::Client,
     /// Path to the persisted reminder-state JSON file (not the store
     /// *directory* — see `reminder_state_path` in `main`), on the same
@@ -469,6 +451,24 @@ struct BotState {
     persisted: Arc<Mutex<PersistedState>>,
     bsr_health: Arc<Mutex<SourceHealth>>,
     br_health: Arc<Mutex<SourceHealth>>,
+}
+
+/// Runtime settings; defaults come from `[reminder]` in the config file.
+#[derive(Serialize, Deserialize, Clone)]
+struct ReminderSettings {
+    reminder_time: TimeOfDay,
+    max_lateness_minutes: u32,
+}
+
+impl BotState {
+    fn reminder_time(&self) -> NaiveTime {
+        let t = self.settings.get().reminder_time;
+        NaiveTime::from_hms_opt(t.hour, t.minute, 0).expect("TimeOfDay is validated")
+    }
+
+    fn max_lateness(&self) -> chrono::Duration {
+        chrono::Duration::minutes(self.settings.get().max_lateness_minutes as i64)
+    }
 }
 
 // ── Message formatting ────────────────────────────────────────────────────────
@@ -718,11 +718,6 @@ fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_secs(secs.min(300))
 }
 
-fn reconnect_backoff_delay(attempt: u32) -> Duration {
-    let secs = 5u64.saturating_mul(1u64 << attempt.min(6));
-    Duration::from_secs(secs.min(300))
-}
-
 /// Matrix handlers run independently from the sync loop. Do not let a panic
 /// in one disappear silently while the process otherwise stays healthy.
 fn spawn_logged<F>(name: &'static str, future: F)
@@ -856,20 +851,20 @@ async fn deliver_reminder_to_room(
 /// retries (and restart recovery, since `pending_reminder` is loaded straight
 /// from disk) never duplicate a send. Only marks the reminder as sent once
 /// every currently-joined room has it.
-async fn resolve_pending_reminder(state: &BotState, client: &Client) {
+async fn resolve_pending_reminder(state: &BotState) {
     let pending = { state.persisted.lock().await.pending_reminder.clone() };
     let Some(mut pending) = pending else {
         return;
     };
 
     let now = reminder_now();
-    if is_pending_expired(&pending, now, state.max_lateness) {
+    if is_pending_expired(&pending, now, state.max_lateness()) {
         error!(
             "Reminder for {} expired unsent: still pending after {}, {}/{} room(s) confirmed, {} attempt(s) — giving up rather than deliver stale \"put them out tonight\" info",
             pending.date,
             format_duration_minutes(now.to_utc() - pending.created_at),
             pending.sent_room_ids.len(),
-            client.joined_rooms().len(),
+            state.bot.broadcast_rooms().len(),
             pending.attempt
         );
         let mut persisted = state.persisted.lock().await;
@@ -879,7 +874,7 @@ async fn resolve_pending_reminder(state: &BotState, client: &Client) {
         return;
     }
 
-    let rooms = client.joined_rooms();
+    let rooms = state.bot.broadcast_rooms();
     let joined_ids: Vec<String> = rooms.iter().map(|r| r.room_id().to_string()).collect();
     let targets = rooms_pending_delivery(&pending, &joined_ids);
 
@@ -991,8 +986,8 @@ async fn maybe_start_reminder(state: &BotState, target_time: NaiveTime) {
     save_persisted_state(&state.reminder_state_path, &persisted).await;
 }
 
-async fn run_scheduler(state: BotState, client: Client) {
-    let target_time = state.reminder_time;
+async fn run_scheduler(state: BotState) {
+    let target_time = state.reminder_time();
     let now = reminder_now();
     let next = next_reminder_datetime(now, target_time);
     info!(
@@ -1006,8 +1001,10 @@ async fn run_scheduler(state: BotState, client: Client) {
         // Order matters: create today's pending reminder first (if due), then
         // attempt delivery in the same tick — a freshly-created reminder
         // doesn't wait for the next tick just to make its first send attempt.
+        // Re-read each tick: admins can change the time at runtime.
+        let target_time = state.reminder_time();
         maybe_start_reminder(&state, target_time).await;
-        resolve_pending_reminder(&state, &client).await;
+        resolve_pending_reminder(&state).await;
 
         let pending_attempt = {
             let persisted = state.persisted.lock().await;
@@ -1039,7 +1036,7 @@ async fn run_scheduler(state: BotState, client: Client) {
 /// tracking — it's a manual dev trigger, not part of the daily production
 /// cadence, and shouldn't affect what the real scheduler considers "already
 /// sent".
-async fn send_test_reminder(state: &BotState, client: &Client) {
+async fn send_test_reminder(state: &BotState) {
     let pickups = fetch_all_pickups(state).await;
     let today = reminder_now().date_naive();
     let Some(next_date) = pickups
@@ -1057,7 +1054,7 @@ async fn send_test_reminder(state: &BotState, client: &Client) {
     // Wait up to 30s for the first sync to populate rooms.
     let mut tries = 0u32;
     let rooms = loop {
-        let joined = client.joined_rooms();
+        let joined = state.bot.broadcast_rooms();
         if !joined.is_empty() {
             break joined;
         }
@@ -1358,7 +1355,7 @@ async fn handle_garbage_command(
         GarbageCommand::Version => garbage_version_message(),
         GarbageCommand::Status => build_status_message(&state).await,
         GarbageCommand::Refresh => {
-            if !state.admin_users.contains(&sender) {
+            if !state.bot.is_admin(&sender) {
                 let msg = "⛔ Admin only.".to_owned();
                 (msg.clone(), msg)
             } else {
@@ -1386,25 +1383,11 @@ async fn handle_garbage_command(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // matrix-sdk's own info/debug logging is very chatty (full sync bodies,
-    // crypto internals); at that volume it can rotate our own — much rarer —
-    // logs out of the container's capped log file before anyone reads them.
-    // Keep our crate at `info` and everything else at `warn` by default,
-    // same pattern as the other bots; RUST_LOG still overrides this.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "garbage_bot=info,matrix_sdk=warn".parse().unwrap()),
-        )
-        .init();
+    mxbot_common::logging::init("garbage_bot");
 
     let test_mode = std::env::args().any(|a| a == "--test");
-    let config_path = std::env::args()
-        .find(|a| a.ends_with(".toml"))
-        .unwrap_or_else(|| "config.toml".to_owned());
-
-    let config_str = fs::read_to_string(&config_path).await?;
-    let mut config: Config = toml::from_str(&config_str)?;
+    let mut config: Config =
+        mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
 
     // Resolve BSR schedule_id if only street/number given
     let schedule_id =
@@ -1431,61 +1414,25 @@ async fn main() -> Result<()> {
             }
         };
 
-    let reminder_time_str = config.reminder.reminder_time.clone();
-    let reminder_time = {
-        let parts: Vec<&str> = reminder_time_str.splitn(2, ':').collect();
-        let invalid =
-            || anyhow!("Invalid reminder_time: {reminder_time_str} (expected HH:MM, 00:00-23:59)");
-        if parts.len() != 2 {
-            return Err(invalid());
-        }
-        let hour: u32 = parts[0].parse().map_err(|_| invalid())?;
-        let minute: u32 = parts[1].parse().map_err(|_| invalid())?;
-        NaiveTime::from_hms_opt(hour, minute, 0).ok_or_else(invalid)?
-    };
-    let max_lateness = chrono::Duration::minutes(config.reminder.max_lateness_minutes as i64);
-
-    let store_path =
-        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
-    let (client, user_id) = mxbot_common::session::build_and_restore(
-        &config.matrix,
-        &store_path,
-        config.security.encryption_strategy.into(),
+    let store_path = mxbot_common::config::store_path_from_env();
+    let settings = Settings::load(
+        store_path.join("settings.json"),
+        ReminderSettings {
+            reminder_time: config.reminder.reminder_time,
+            max_lateness_minutes: config.reminder.max_lateness_minutes,
+        },
     )
     .await?;
 
-    let admin_users: HashSet<OwnedUserId> = config
-        .security
-        .admin_users
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    let allowed_inviters: HashSet<OwnedUserId> = config
-        .security
-        .allowed_inviters
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    let verification = VerificationService::allowlisted_tofu_from_config(
-        client.clone(),
-        &config.security.verification,
-        &config.security.allowed_inviters,
-    );
-    verification.install_handlers();
-
-    if admin_users.is_empty() {
-        warn!("No admin_users configured — !reset-trust and !garbage refresh are disabled");
-    } else {
-        info!("Admin users: {admin_users:?}");
-    }
-
-    if allowed_inviters.is_empty() {
-        warn!("No allowed_inviters configured — bot will accept invites from anyone");
-    } else {
-        info!("Allowed inviters: {allowed_inviters:?}");
-    }
+    let bot = Bot::builder("garbage-bot", env!("CARGO_PKG_VERSION"))
+        .store_path(&store_path)
+        .settings(settings.store().clone())
+        .admin_help(
+            "!garbage status · !garbage refresh\n\
+             Settings: reminder_time (HH:MM, Europe/Berlin), max_lateness_minutes",
+        )
+        .start(&config.matrix, &config.security)
+        .await?;
 
     let berlin_recycling_creds = config.berlin_recycling.map(|br| (br.username, br.password));
     if berlin_recycling_creds.is_some() {
@@ -1504,16 +1451,12 @@ async fn main() -> Result<()> {
     }
 
     let state = BotState {
-        bot_user_id: user_id,
-        admin_users,
-        allowed_inviters,
-        verification,
+        bot: bot.clone(),
         bsr_schedule_id: schedule_id,
         berlin_recycling_creds,
         waste_labels: config.waste_labels,
         waste_colors: config.waste_colors,
-        reminder_time,
-        max_lateness,
+        settings,
         http: reqwest::Client::new(),
         reminder_state_path,
         confirmed: Arc::new(Mutex::new(HashMap::new())),
@@ -1522,91 +1465,29 @@ async fn main() -> Result<()> {
         br_health: Arc::new(Mutex::new(SourceHealth::default())),
     };
 
-    // Auto-join invited rooms (only from allowed_inviters)
-    client.add_event_handler({
+    // In-room messages: admin console first, then !garbage commands.
+    bot.client.add_event_handler({
         let state = state.clone();
-        move |ev: StrippedRoomMemberEvent, room: Room, client: Client| {
+        move |ev: OriginalSyncRoomMessageEvent, room: Room, encryption: Option<EncryptionInfo>| {
             let state = state.clone();
             async move {
-                if ev.state_key != state.bot_user_id {
+                if ev.sender == state.bot.user_id || room.state() != RoomState::Joined {
                     return;
                 }
-                if !state.allowed_inviters.is_empty() && !state.allowed_inviters.contains(&ev.sender) {
-                    warn!("Rejecting invite from {} (not in allowed_inviters)", ev.sender);
-                    room.leave().await.ok();
-                    return;
-                }
-                info!("Accepted invite from {} to {}", ev.sender, room.room_id());
-                let room_id = room.room_id().to_owned();
-                let mut via: Vec<OwnedServerName> = vec![ev.sender.server_name().to_owned()];
-                if let Some(s) = room_id.server_name() {
-                    let s = s.to_owned();
-                    if !via.contains(&s) {
-                        via.push(s);
-                    }
-                }
-                let room_or_alias = match RoomOrAliasId::parse(room_id.as_str()) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        error!("Invalid room ID {room_id}: {e}");
-                        return;
-                    }
-                };
-                spawn_logged("join-invited-room", async move {
-                    let mut delay = 2u64;
-                    const MAX_ATTEMPTS: u32 = 8;
-                    for attempt in 1..=MAX_ATTEMPTS {
-                        match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                            Ok(_) => {
-                                info!("Joined {room_id}");
-                                return;
-                            }
-                            Err(ref e) if mxbot_common::verify::is_join_terminal(e) => {
-                                warn!("Join failed (terminal) for {room_id}: {e}");
-                                return;
-                            }
-                            Err(e) if attempt == MAX_ATTEMPTS => {
-                                warn!("Join failed after {MAX_ATTEMPTS} attempts for {room_id}: {e}");
-                            }
-                            Err(e) => {
-                                warn!("Join attempt {attempt}/{MAX_ATTEMPTS} failed for {room_id}: {e}; retry in {delay}s");
-                                sleep(Duration::from_secs(delay)).await;
-                                delay = (delay * 2).min(300);
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    });
-
-    // In-room messages: verification requests are handled by mxbot-common.
-    client.add_event_handler({
-        let state = state.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room| {
-            let state = state.clone();
-            async move {
-                if let MessageType::VerificationRequest(_) = &ev.content.msgtype {
-                    return;
-                }
-
-                if ev.sender == state.bot_user_id || room.state() != RoomState::Joined {
+                if state
+                    .bot
+                    .admin
+                    .handle(&room, &ev, encryption.as_ref())
+                    .await
+                    == Dispatch::Handled
+                {
                     return;
                 }
 
                 let MessageType::Text(ref text) = ev.content.msgtype else {
                     return;
                 };
-                let raw = text.body.trim();
-
-                if state
-                    .verification
-                    .handle_admin_command(&ev.sender, &state.admin_users, raw)
-                    .await
-                {
-                    return;
-                }
-                if let Some(cmd) = parse_garbage_command(raw) {
+                if let Some(cmd) = parse_garbage_command(text.body.trim()) {
                     spawn_logged(
                         "garbage-command",
                         handle_garbage_command(state.clone(), room, cmd, ev.sender.clone()),
@@ -1617,7 +1498,7 @@ async fn main() -> Result<()> {
     });
 
     // Reactions
-    client.add_event_handler({
+    bot.client.add_event_handler({
         let state = state.clone();
         move |ev: OriginalSyncReactionEvent, room: Room| {
             let state = state.clone();
@@ -1633,97 +1514,27 @@ async fn main() -> Result<()> {
     // Scheduler
     spawn_logged("reminder-scheduler", {
         let state = state.clone();
-        let client = client.clone();
         async move {
             if test_mode {
                 info!("Test mode: sending next upcoming reminder immediately");
-                send_test_reminder(&state, &client).await;
+                send_test_reminder(&state).await;
                 info!("Test reminder sent. Waiting for reactions (Ctrl+C to quit)...");
             } else {
-                run_scheduler(state, client).await;
+                run_scheduler(state).await;
             }
         }
     });
 
     info!("Starting Matrix sync...");
-    let filter = FilterDefinition::with_lazy_loading();
-    let mut initial_sync_attempt = 0u32;
-    loop {
-        match client
-            .sync_once(SyncSettings::default().filter(filter.clone().into()))
-            .await
-        {
-            Ok(_) => {
-                info!(
-                    attempt = initial_sync_attempt + 1,
-                    "Initial Matrix sync completed"
-                );
-                break;
-            }
-            Err(e) => {
-                let delay = reconnect_backoff_delay(initial_sync_attempt);
-                initial_sync_attempt = initial_sync_attempt.saturating_add(1);
-                warn!(
-                    attempt = initial_sync_attempt,
-                    retry_in_secs = delay.as_secs(),
-                    error = %e,
-                    "Initial Matrix sync failed; retrying without terminating scheduler"
-                );
-                sleep(delay).await;
-            }
-        }
-    }
-
-    // Drain pending invites from prior sessions.
-    let invited = client.invited_rooms();
-    if !invited.is_empty() {
-        info!(
-            "Pending invite(s) found after initial sync — joining {} room(s)",
-            invited.len()
-        );
-        for room in invited {
-            let room_id = room.room_id().to_owned();
-            let via: Vec<OwnedServerName> = room_id
-                .server_name()
-                .map(|s| vec![s.to_owned()])
-                .unwrap_or_default();
-            match RoomOrAliasId::parse(room_id.as_str()) {
-                Ok(room_or_alias) => {
-                    match client.join_room_by_id_or_alias(&room_or_alias, &via).await {
-                        Ok(_) => info!("Joined pending invite room {room_id}"),
-                        Err(e) => warn!("Failed to join pending invite room {room_id}: {e}"),
-                    }
-                }
-                Err(e) => warn!("Invalid room ID in pending invite {room_id}: {e}"),
-            }
-        }
-    }
-
-    let mut sync_attempt = 0u32;
-    loop {
-        match client
-            .sync(SyncSettings::default().filter(filter.clone().into()))
-            .await
-        {
-            Ok(()) => warn!("Matrix sync loop exited cleanly; reconnecting"),
-            Err(e) => warn!(error = %e, "Matrix sync loop failed; reconnecting"),
-        }
-        let delay = reconnect_backoff_delay(sync_attempt);
-        sync_attempt = sync_attempt.saturating_add(1);
-        warn!(
-            attempt = sync_attempt,
-            retry_in_secs = delay.as_secs(),
-            "Waiting before Matrix sync reconnect"
-        );
-        sleep(delay).await;
-    }
+    bot.initial_sync().await;
+    bot.sync_forever().await
 }
 
 // ── Reaction handler ──────────────────────────────────────────────────────────
 
 async fn handle_reaction(state: BotState, room: Room, ev: OriginalSyncReactionEvent) {
     // Ignore the bot's own seed reaction — it only exists to show users the button.
-    if ev.sender == state.bot_user_id {
+    if ev.sender == state.bot.user_id {
         return;
     }
 
@@ -2254,14 +2065,6 @@ mod tests {
         assert_eq!(backoff_delay(1), Duration::from_secs(10));
         assert_eq!(backoff_delay(2), Duration::from_secs(20));
         assert_eq!(backoff_delay(10), Duration::from_secs(300)); // capped, never gives up
-    }
-
-    #[test]
-    fn reconnect_backoff_is_bounded_exponential() {
-        assert_eq!(reconnect_backoff_delay(0), Duration::from_secs(5));
-        assert_eq!(reconnect_backoff_delay(1), Duration::from_secs(10));
-        assert_eq!(reconnect_backoff_delay(2), Duration::from_secs(20));
-        assert_eq!(reconnect_backoff_delay(99), Duration::from_secs(300));
     }
 
     #[test]

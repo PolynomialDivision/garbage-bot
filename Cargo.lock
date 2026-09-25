@@ -1007,16 +1007,12 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "futures-util",
- "matrix-sdk",
- "matrix-sdk-crypto",
  "mxbot-common",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
- "toml",
  "tracing",
- "tracing-subscriber",
  "url",
 ]
 
@@ -2134,16 +2130,19 @@ dependencies = [
 
 [[package]]
 name = "mxbot-common"
-version = "0.1.0"
-source = "git+https://github.com/PolynomialDivision/mxbot-common#f1196f44ea2ffa21c908df52e3cd8d1907f8f813"
+version = "0.2.0"
+source = "git+https://github.com/PolynomialDivision/mxbot-common#89d0ed0b60e60ee7beeb4cf79f83197cc87943ce"
 dependencies = [
  "anyhow",
  "futures-util",
  "matrix-sdk",
  "matrix-sdk-crypto",
  "serde",
+ "serde_json",
  "tokio",
+ "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
