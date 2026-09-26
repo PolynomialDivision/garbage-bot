@@ -20,8 +20,10 @@ use mxbot_common::{
             events::{
                 reaction::{OriginalSyncReactionEvent, ReactionEventContent},
                 relation::Annotation,
+                relation::Reply,
                 room::message::{
-                    MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+                    MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
+                    RoomMessageEventContent,
                 },
                 Mentions,
             },
@@ -92,6 +94,14 @@ struct ReminderConfig {
     /// misleading rather than helpful.
     #[serde(default = "default_max_lateness_minutes")]
     max_lateness_minutes: u32,
+    /// Minutes after the reminder at which one follow-up is posted if nobody
+    /// has confirmed with ✅ yet. 0 disables it.
+    #[serde(default = "default_followup_minutes")]
+    followup_minutes: u32,
+}
+
+fn default_followup_minutes() -> u32 {
+    120 // a 20:00 reminder follows up at 22:00
 }
 
 fn default_reminder_time() -> TimeOfDay {
@@ -107,11 +117,23 @@ impl Default for ReminderConfig {
         Self {
             reminder_time: default_reminder_time(),
             max_lateness_minutes: default_max_lateness_minutes(),
+            followup_minutes: default_followup_minutes(),
         }
     }
 }
 
 // ── BSR API ───────────────────────────────────────────────────────────────────
+
+/// Upper bound for any single schedule request. Without it a hanging portal
+/// would stall the scheduler (and every `!garbage` command) indefinitely.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .expect("building the HTTP client")
+}
 
 const BSR_PICKUPS: &str = "https://umnewforms.bsr.de/p/de.bsr.adressen.app/abfuhrEvents";
 const BSR_STREETS: &str = "https://umnewforms.bsr.de/p/de.bsr.adressen.app/streetNames";
@@ -245,7 +267,10 @@ async fn fetch_berlin_recycling_pickups(
     waste_labels: &HashMap<String, String>,
 ) -> Result<Vec<Pickup>> {
     // Each call creates a fresh session — the portal is stateful via cookies.
-    let http = reqwest::Client::builder().cookie_store(true).build()?;
+    let http = reqwest::Client::builder()
+        .cookie_store(true)
+        .timeout(HTTP_TIMEOUT)
+        .build()?;
 
     // Establish session
     http.get(BR_PORTAL).send().await?;
@@ -363,6 +388,52 @@ struct PendingReminder {
     created_at: DateTime<chrono::Utc>,
 }
 
+/// The most recent reminder that reached at least one room: where it was
+/// posted and who confirmed it. Persisted so ✅ taps keep working — and the
+/// follow-up stays suppressed — across restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PostedReminder {
+    date: NaiveDate,
+    pickups: Vec<Pickup>,
+    /// Room ID → event ID of the reminder message in that room.
+    event_ids: HashMap<String, String>,
+    sent_at: DateTime<chrono::Utc>,
+    #[serde(default)]
+    confirmations: Vec<Confirmation>,
+    #[serde(default)]
+    followup_sent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Confirmation {
+    user_id: String,
+    name: String,
+    at: DateTime<chrono::Utc>,
+}
+
+impl PostedReminder {
+    fn is_reminder_event(&self, event_id: &str) -> bool {
+        self.event_ids.values().any(|id| id == event_id)
+    }
+
+    /// "Alice (21:14), Bob (21:20)" — who confirmed, in order.
+    fn confirmed_by(&self) -> Option<String> {
+        (!self.confirmations.is_empty()).then(|| {
+            self.confirmations
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} ({})",
+                        c.name,
+                        c.at.with_timezone(&REMINDER_TZ).format("%H:%M")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedState {
     #[serde(default)]
@@ -386,6 +457,8 @@ struct PersistedState {
     last_expired_date: Option<NaiveDate>,
     #[serde(default)]
     pending_reminder: Option<PendingReminder>,
+    #[serde(default)]
+    posted: Option<PostedReminder>,
 }
 
 async fn load_persisted_state(path: &Path) -> PersistedState {
@@ -446,8 +519,9 @@ struct BotState {
     /// bind-mounted volume as the Matrix session store so it survives
     /// container restarts/recreation.
     reminder_state_path: PathBuf,
-    // reminder event_id -> set of display names that confirmed
-    confirmed: Arc<Mutex<HashMap<OwnedEventId, HashSet<String>>>>,
+    /// Serializes edits of the reminder message, so two quick ✅ taps cannot
+    /// leave the older text as the final edit.
+    edit_lock: Arc<Mutex<()>>,
     persisted: Arc<Mutex<PersistedState>>,
     bsr_health: Arc<Mutex<SourceHealth>>,
     br_health: Arc<Mutex<SourceHealth>>,
@@ -458,6 +532,7 @@ struct BotState {
 struct ReminderSettings {
     reminder_time: TimeOfDay,
     max_lateness_minutes: u32,
+    followup_minutes: u32,
 }
 
 impl BotState {
@@ -468,6 +543,11 @@ impl BotState {
 
     fn max_lateness(&self) -> chrono::Duration {
         chrono::Duration::minutes(self.settings.get().max_lateness_minutes as i64)
+    }
+
+    fn followup_after(&self) -> Option<chrono::Duration> {
+        let minutes = self.settings.get().followup_minutes;
+        (minutes > 0).then(|| chrono::Duration::minutes(minutes as i64))
     }
 }
 
@@ -518,10 +598,13 @@ fn hex_to_dot(hex: &str) -> &'static str {
     }
 }
 
+/// The reminder message. Once someone confirmed, `confirmed_by` replaces the
+/// call to action, so the message itself shows that it is taken care of.
 fn build_reminder(
     pickups: &[Pickup],
     pickup_date: NaiveDate,
     colors: &HashMap<String, String>,
+    confirmed_by: Option<&str>,
 ) -> (String, String) {
     let day = pickup_date.format("%A, %-d %b").to_string();
     let day_pickups: Vec<&Pickup> = pickups
@@ -557,11 +640,20 @@ fn build_reminder(
         "bins"
     };
 
-    let plain = format!(
-        "📢 Garbage reminder for tomorrow\n{day}\n\n{plain_bins}\n\n@room · Put the {bin_word} out tonight · ✅ when done"
-    );
+    let (footer_plain, footer_html) = match confirmed_by {
+        Some(names) => (
+            format!("✅ Done — {names}"),
+            format!("✅ <strong>Done</strong> — {}", escape_html(names)),
+        ),
+        None => {
+            let footer = format!("@room · Put the {bin_word} out tonight · ✅ when done");
+            (footer.clone(), footer)
+        }
+    };
+    let plain =
+        format!("📢 Garbage reminder for tomorrow\n{day}\n\n{plain_bins}\n\n{footer_plain}");
     let html = format!(
-        "📢 <strong>Garbage reminder for tomorrow</strong><br><strong>{day}</strong><br><br>{html_bins}<br><br>@room · Put the {bin_word} out tonight · ✅ when done"
+        "📢 <strong>Garbage reminder for tomorrow</strong><br><strong>{day}</strong><br><br>{html_bins}<br><br>{footer_html}"
     );
     (plain, html)
 }
@@ -631,10 +723,18 @@ fn apply_fetch_outcome(
 }
 
 async fn fetch_all_pickups(state: &BotState) -> Vec<Pickup> {
+    // Network first, without holding the state lock: a slow portal must not
+    // block reactions, status replies or the scheduler meanwhile.
+    let bsr_outcome = fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await;
+    let br_outcome = match state.berlin_recycling_creds {
+        Some((ref user, ref pass)) => {
+            Some(fetch_berlin_recycling_pickups(user, pass, &state.waste_labels).await)
+        }
+        None => None,
+    };
+
     let today = reminder_now().date_naive();
     let mut persisted = state.persisted.lock().await;
-
-    let bsr_outcome = fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await;
     persisted.bsr_cache = apply_fetch_outcome(
         "BSR",
         &persisted.bsr_cache,
@@ -642,10 +742,7 @@ async fn fetch_all_pickups(state: &BotState) -> Vec<Pickup> {
         &mut *state.bsr_health.lock().await,
         today,
     );
-    let mut pickups = persisted.bsr_cache.clone();
-
-    if let Some((ref user, ref pass)) = state.berlin_recycling_creds {
-        let br_outcome = fetch_berlin_recycling_pickups(user, pass, &state.waste_labels).await;
+    if let Some(br_outcome) = br_outcome {
         persisted.br_cache = apply_fetch_outcome(
             "Berlin Recycling",
             &persisted.br_cache,
@@ -653,12 +750,46 @@ async fn fetch_all_pickups(state: &BotState) -> Vec<Pickup> {
             &mut *state.br_health.lock().await,
             today,
         );
+    }
+    save_persisted_state(&state.reminder_state_path, &persisted).await;
+    combined_cache(&persisted, state.berlin_recycling_creds.is_some())
+}
+
+fn combined_cache(persisted: &PersistedState, with_br: bool) -> Vec<Pickup> {
+    let mut pickups = persisted.bsr_cache.clone();
+    if with_br {
         pickups.extend(persisted.br_cache.iter().cloned());
     }
-
     pickups.sort_by_key(|p| p.date);
-    save_persisted_state(&state.reminder_state_path, &persisted).await;
     pickups
+}
+
+/// How old the cached schedule may be before a `!garbage` query refetches.
+/// Collection dates change rarely; logging into Berlin Recycling for every
+/// query made replies slow for no benefit.
+const SCHEDULE_MAX_AGE: chrono::Duration = chrono::Duration::hours(6);
+
+/// The schedule for `!garbage` queries: the cache while it is fresh, a
+/// refetch once any source is older than `SCHEDULE_MAX_AGE` or failing.
+async fn current_pickups(state: &BotState) -> Vec<Pickup> {
+    let now = reminder_now();
+    let stale = |health: &SourceHealth| {
+        health.last_error.is_some()
+            || health
+                .last_success
+                .is_none_or(|t| now.signed_duration_since(t) > SCHEDULE_MAX_AGE)
+    };
+    let bsr_stale = stale(&*state.bsr_health.lock().await);
+    let br_stale = state.berlin_recycling_creds.is_some() && stale(&*state.br_health.lock().await);
+    if bsr_stale || br_stale {
+        return fetch_all_pickups(state).await;
+    }
+    let today = now.date_naive();
+    let persisted = state.persisted.lock().await;
+    combined_cache(&persisted, state.berlin_recycling_creds.is_some())
+        .into_iter()
+        .filter(|p| p.date >= today)
+        .collect()
 }
 
 /// All pickups scheduled on exactly `date`.
@@ -810,7 +941,6 @@ fn reminder_transaction_id(pending: &PendingReminder, room_id: &str) -> OwnedTra
 /// persisted/retried production path and the ephemeral `--test` path so
 /// there's exactly one place that knows how to deliver a reminder message.
 async fn deliver_reminder_to_room(
-    state: &BotState,
     room: &Room,
     plain: &str,
     html: &str,
@@ -829,12 +959,6 @@ async fn deliver_reminder_to_room(
         None => room.send(content).await?,
     };
     let event_id = resp.response.event_id;
-
-    state
-        .confirmed
-        .lock()
-        .await
-        .insert(event_id.clone(), HashSet::new());
 
     let reaction = ReactionEventContent::new(Annotation::new(event_id.clone(), "✅".to_owned()));
     if let Err(e) = room.send(reaction).await {
@@ -886,18 +1010,25 @@ async fn resolve_pending_reminder(state: &BotState) {
         );
     }
 
-    let (plain, html) = build_reminder(&pending.pickups, pending.date, &state.waste_colors);
+    let (plain, html) = build_reminder(&pending.pickups, pending.date, &state.waste_colors, None);
     for room in &rooms {
         let room_id = room.room_id().to_string();
         if !targets.contains(&room_id) {
             continue;
         }
         let transaction_id = reminder_transaction_id(&pending, &room_id);
-        match deliver_reminder_to_room(state, room, &plain, &html, Some(transaction_id)).await {
+        match deliver_reminder_to_room(room, &plain, &html, Some(transaction_id)).await {
             Ok(event_id) => {
                 info!(
                     "Reminder delivered: room={room_id} date={} event_id={event_id}",
                     pending.date
+                );
+                // Recorded right away so an immediate ✅ is already matched.
+                record_posted(
+                    &mut *state.persisted.lock().await,
+                    &pending.pickups,
+                    pending.date,
+                    vec![(room_id.clone(), event_id.to_string())],
                 );
                 pending.sent_room_ids.insert(room_id);
             }
@@ -926,6 +1057,31 @@ async fn resolve_pending_reminder(state: &BotState) {
         persisted.pending_reminder = Some(pending);
     }
     save_persisted_state(&state.reminder_state_path, &persisted).await;
+}
+
+/// Remember where the reminder for `date` was posted, so ✅ reactions on it
+/// can be matched (also after a restart) and the message edited.
+fn record_posted(
+    persisted: &mut PersistedState,
+    pickups: &[Pickup],
+    date: NaiveDate,
+    delivered: Vec<(String, String)>,
+) {
+    if delivered.is_empty() {
+        return;
+    }
+    let posted = match &mut persisted.posted {
+        Some(posted) if posted.date == date => posted,
+        slot => slot.insert(PostedReminder {
+            date,
+            pickups: pickups.to_vec(),
+            event_ids: HashMap::new(),
+            sent_at: reminder_now_utc(),
+            confirmations: Vec::new(),
+            followup_sent: false,
+        }),
+    };
+    posted.event_ids.extend(delivered);
 }
 
 /// If a new reminder is due, fetch the schedule and persist it as pending
@@ -1005,6 +1161,7 @@ async fn run_scheduler(state: BotState) {
         let target_time = state.reminder_time();
         maybe_start_reminder(&state, target_time).await;
         resolve_pending_reminder(&state).await;
+        maybe_send_followup(&state).await;
 
         let pending_attempt = {
             let persisted = state.persisted.lock().await;
@@ -1014,8 +1171,17 @@ async fn run_scheduler(state: BotState) {
             Some(attempt) => backoff_delay(attempt),
             None => {
                 let now = reminder_now();
-                let target_dt = next_reminder_datetime(now, target_time);
-                Duration::from_secs((target_dt - now).num_seconds().max(1) as u64)
+                let target_dt = next_reminder_datetime(now, target_time).to_utc();
+                let followup_dt = {
+                    let persisted = state.persisted.lock().await;
+                    persisted
+                        .posted
+                        .as_ref()
+                        .zip(state.followup_after())
+                        .and_then(|(posted, after)| followup_due_at(posted, after))
+                };
+                let wake = followup_dt.map_or(target_dt, |f| f.min(target_dt));
+                Duration::from_secs((wake - now.to_utc()).num_seconds().max(1) as u64)
                     .min(Duration::from_secs(15 * 60))
             }
         };
@@ -1066,17 +1232,29 @@ async fn send_test_reminder(state: &BotState) {
         tries += 1;
     };
 
-    let (plain, html) = build_reminder(&day_pickups, next_date, &state.waste_colors);
+    let (plain, html) = build_reminder(&day_pickups, next_date, &state.waste_colors, None);
+    let mut delivered = Vec::new();
     for room in rooms {
-        match deliver_reminder_to_room(state, &room, &plain, &html, None).await {
-            Ok(event_id) => info!(
-                "Sent test reminder to {}, event_id={}",
-                room.room_id(),
-                event_id
-            ),
+        match deliver_reminder_to_room(&room, &plain, &html, None).await {
+            Ok(event_id) => {
+                info!(
+                    "Sent test reminder to {}, event_id={}",
+                    room.room_id(),
+                    event_id
+                );
+                delivered.push((room.room_id().to_string(), event_id.to_string()));
+            }
             Err(e) => error!("Failed to send test reminder to {}: {e}", room.room_id()),
         }
     }
+    // Tracked like a real reminder so ✅ on the test message can be tried
+    // out; the next real reminder replaces it.
+    record_posted(
+        &mut *state.persisted.lock().await,
+        &day_pickups,
+        next_date,
+        delivered,
+    );
 }
 
 // ── !garbage command ────────────────────────────────────────────────────────
@@ -1186,10 +1364,15 @@ fn pickups_this_week(pickups: &[Pickup], today: NaiveDate) -> Vec<Pickup> {
 /// reading (`Fri, 24 Jul`), with the year appended only when it differs
 /// from the current year.
 fn format_relative_date(date: NaiveDate, today: NaiveDate) -> String {
-    if date.year() == today.year() {
+    let absolute = if date.year() == today.year() {
         date.format("%a, %-d %b").to_string()
     } else {
         date.format("%a, %-d %b %Y").to_string()
+    };
+    match (date - today).num_days() {
+        0 => format!("{absolute} (today)"),
+        1 => format!("{absolute} (tomorrow)"),
+        _ => absolute,
     }
 }
 
@@ -1243,7 +1426,7 @@ fn describe_source_health(health: &SourceHealth, cached_count: usize) -> String 
 fn describe_reminder_state(persisted: &PersistedState) -> String {
     let base = match &persisted.pending_reminder {
         Some(p) => format!(
-            "pending for {} · attempt {} · {} room(s) confirmed",
+            "pending for {} · attempt {} · delivered to {} room(s)",
             p.date,
             p.attempt,
             p.sent_room_ids.len()
@@ -1252,6 +1435,14 @@ fn describe_reminder_state(persisted: &PersistedState) -> String {
             Some(d) => format!("last sent {d}"),
             None => "none sent yet".to_owned(),
         },
+    };
+    let base = match &persisted.posted {
+        Some(posted) => match posted.confirmed_by() {
+            Some(names) => format!("{base} · ✅ {names}"),
+            None if posted.followup_sent => format!("{base} · no ✅ yet, follow-up sent"),
+            None => format!("{base} · no ✅ yet"),
+        },
+        None => base,
     };
     match persisted.last_expired_date {
         Some(d) => format!("{base} · ⚠ {d} expired unsent"),
@@ -1365,7 +1556,7 @@ async fn handle_garbage_command(
             }
         }
         GarbageCommand::NextPerType | GarbageCommand::NextEvent | GarbageCommand::Week => {
-            let pickups = dedup_pickups(fetch_all_pickups(&state).await);
+            let pickups = dedup_pickups(current_pickups(&state).await);
             let today = reminder_now().date_naive();
             build_garbage_reply(cmd, &pickups, today, &state.waste_colors)
         }
@@ -1407,7 +1598,7 @@ async fn main() -> Result<()> {
                     "Resolving BSR schedule_id for {street} {number}{}...",
                     plz.map(|p| format!(", PLZ {p}")).unwrap_or_default()
                 );
-                let http = reqwest::Client::new();
+                let http = http_client();
                 let id = resolve_schedule_id(&http, street, number, plz).await?;
                 info!("Resolved schedule_id: {id}");
                 id
@@ -1420,6 +1611,7 @@ async fn main() -> Result<()> {
         ReminderSettings {
             reminder_time: config.reminder.reminder_time,
             max_lateness_minutes: config.reminder.max_lateness_minutes,
+            followup_minutes: config.reminder.followup_minutes,
         },
     )
     .await?;
@@ -1429,7 +1621,8 @@ async fn main() -> Result<()> {
         .settings(settings.store().clone())
         .admin_help(
             "!garbage status · !garbage refresh\n\
-             Settings: reminder_time (HH:MM, Europe/Berlin), max_lateness_minutes",
+             Settings: reminder_time (HH:MM, Europe/Berlin), max_lateness_minutes,\n\
+             followup_minutes (nudge when nobody confirmed; 0 = off)",
         )
         .start(&config.matrix, &config.security)
         .await?;
@@ -1457,9 +1650,9 @@ async fn main() -> Result<()> {
         waste_labels: config.waste_labels,
         waste_colors: config.waste_colors,
         settings,
-        http: reqwest::Client::new(),
+        http: http_client(),
         reminder_state_path,
-        confirmed: Arc::new(Mutex::new(HashMap::new())),
+        edit_lock: Arc::new(Mutex::new(())),
         persisted: Arc::new(Mutex::new(persisted)),
         bsr_health: Arc::new(Mutex::new(SourceHealth::default())),
         br_health: Arc::new(Mutex::new(SourceHealth::default())),
@@ -1537,44 +1730,193 @@ async fn handle_reaction(state: BotState, room: Room, ev: OriginalSyncReactionEv
     if ev.sender == state.bot.user_id {
         return;
     }
-
-    let related_id = &ev.content.relates_to.event_id;
     let key = strip_variation_selectors(&ev.content.relates_to.key);
-
-    let mut confirmed = state.confirmed.lock().await;
-    let Some(names) = confirmed.get_mut(related_id) else {
-        return; // not a tracked reminder
-    };
-
     if !DONE_REACTIONS.contains(&key.as_str()) {
         return;
     }
+    let related_id = ev.content.relates_to.event_id.to_string();
+    let is_reminder = {
+        let persisted = state.persisted.lock().await;
+        persisted
+            .posted
+            .as_ref()
+            .is_some_and(|posted| posted.is_reminder_event(&related_id))
+    };
+    if !is_reminder {
+        return; // not the current reminder
+    }
 
-    let display_name = room
+    let name = room
         .get_member(ev.sender.as_ref())
         .await
         .ok()
         .flatten()
         .and_then(|m| m.display_name().map(str::to_owned))
-        .unwrap_or_else(|| ev.sender.to_string());
+        .unwrap_or_else(|| ev.sender.localpart().to_owned());
 
-    if !names.insert(display_name.clone()) {
-        return; // already confirmed
-    }
-
-    let count = names.len();
-    let all_names = {
-        let mut sorted: Vec<_> = names.iter().cloned().collect();
-        sorted.sort();
-        sorted.join(", ")
+    let posted = {
+        let mut persisted = state.persisted.lock().await;
+        let Some(posted) = persisted
+            .posted
+            .as_mut()
+            .filter(|posted| posted.is_reminder_event(&related_id))
+        else {
+            return;
+        };
+        if !add_confirmation(posted, ev.sender.as_str(), &name, reminder_now_utc()) {
+            return; // already confirmed
+        }
+        let posted = posted.clone();
+        save_persisted_state(&state.reminder_state_path, &persisted).await;
+        posted
     };
-    drop(confirmed);
+    info!(
+        "Confirmation from {name} for {} ({} total)",
+        posted.date,
+        posted.confirmations.len()
+    );
+    edit_reminder_messages(&state).await;
+}
 
-    let msg = format!("✅ {display_name} put the bins out! ({count} confirmed: {all_names})");
-    info!("Confirmation from {display_name} (total: {count})");
+/// Record that `user_id` confirmed; false if they already had.
+fn add_confirmation(
+    posted: &mut PostedReminder,
+    user_id: &str,
+    name: &str,
+    at: DateTime<chrono::Utc>,
+) -> bool {
+    if posted.confirmations.iter().any(|c| c.user_id == user_id) {
+        return false;
+    }
+    posted.confirmations.push(Confirmation {
+        user_id: user_id.to_owned(),
+        name: name.to_owned(),
+        at,
+    });
+    true
+}
 
-    if let Err(e) = room.send(RoomMessageEventContent::text_plain(msg)).await {
-        error!("Failed to send confirmation: {e}");
+/// Rewrite the reminder in every room to show who confirmed. An edit instead
+/// of a new message: the room sees the reminder turn into "✅ Done — Alice"
+/// without another notification.
+async fn edit_reminder_messages(state: &BotState) {
+    let _serialized = state.edit_lock.lock().await;
+    // Render from the latest state, not the caller's snapshot: a later
+    // confirmation must never be overwritten by an older edit.
+    let Some(posted) = state.persisted.lock().await.posted.clone() else {
+        return;
+    };
+    let confirmed_by = posted.confirmed_by();
+    let (plain, html) = build_reminder(
+        &posted.pickups,
+        posted.date,
+        &state.waste_colors,
+        confirmed_by.as_deref(),
+    );
+    for room in state.bot.broadcast_rooms() {
+        let Some(event_id) = posted
+            .event_ids
+            .get(room.room_id().as_str())
+            .and_then(|id| id.parse::<OwnedEventId>().ok())
+        else {
+            continue;
+        };
+        let content = RoomMessageEventContent::text_html(plain.clone(), html.clone())
+            .add_mentions(Mentions::with_room_mention())
+            // The original already mentioned @room: passing its mentions
+            // keeps the edit from notifying everyone again.
+            .make_replacement(ReplacementMetadata::new(
+                event_id,
+                Some(Mentions::with_room_mention()),
+            ));
+        if let Err(e) = room.send(content).await {
+            error!("Failed to update reminder in {}: {e}", room.room_id());
+        }
+    }
+}
+
+// ── Follow-up when nobody confirmed ──────────────────────────────────────────
+
+/// Collection crews start early; a nudge after this hour on collection day
+/// would only arrive once the bins are gone.
+const LAST_FOLLOWUP_HOUR: u32 = 6;
+
+/// When the one follow-up for `posted` is due, if it still can be: not yet
+/// sent, nobody confirmed, and before the early morning of collection day.
+fn followup_due_at(
+    posted: &PostedReminder,
+    followup_after: chrono::Duration,
+) -> Option<DateTime<chrono::Utc>> {
+    if posted.followup_sent || !posted.confirmations.is_empty() {
+        return None;
+    }
+    let due = posted.sent_at + followup_after;
+    let deadline = resolve_local(
+        &REMINDER_TZ,
+        posted
+            .date
+            .and_hms_opt(LAST_FOLLOWUP_HOUR, 0, 0)
+            .expect("valid time"),
+    );
+    (due < deadline.to_utc()).then_some(due)
+}
+
+fn followup_text(posted: &PostedReminder, now: DateTime<Tz>) -> (String, String) {
+    let when = if now.date_naive() >= posted.date {
+        "this morning"
+    } else {
+        "tomorrow morning"
+    };
+    let plain = format!(
+        "⏰ @room Nobody has confirmed the bins yet — collection is {when}. \
+         Tap ✅ on the reminder once they're out."
+    );
+    (plain.clone(), plain)
+}
+
+/// Post the follow-up once, as a reply to the reminder in each room.
+async fn maybe_send_followup(state: &BotState) {
+    let Some(followup_after) = state.followup_after() else {
+        return;
+    };
+    let now = reminder_now();
+    let posted = {
+        let mut persisted = state.persisted.lock().await;
+        let Some(posted) = persisted.posted.as_mut() else {
+            return;
+        };
+        match followup_due_at(posted, followup_after) {
+            Some(due) if now.to_utc() >= due => {}
+            Some(_) => return,
+            None => {
+                return;
+            }
+        }
+        // Marked before sending: one follow-up at most, even if a send fails.
+        posted.followup_sent = true;
+        let posted = posted.clone();
+        save_persisted_state(&state.reminder_state_path, &persisted).await;
+        posted
+    };
+
+    let (plain, html) = followup_text(&posted, now);
+    for room in state.bot.broadcast_rooms() {
+        let Some(event_id) = posted
+            .event_ids
+            .get(room.room_id().as_str())
+            .and_then(|id| id.parse::<OwnedEventId>().ok())
+        else {
+            continue;
+        };
+        let mut content = RoomMessageEventContent::text_html(plain.clone(), html.clone())
+            .add_mentions(Mentions::with_room_mention());
+        content.relates_to = Some(Relation::Reply(Reply::with_event_id(event_id)));
+        let transaction_id: OwnedTransactionId =
+            format!("garbage-followup-{}-{}", posted.date, room.room_id()).into();
+        match room.send(content).with_transaction_id(transaction_id).await {
+            Ok(_) => info!("Follow-up sent to {} for {}", room.room_id(), posted.date),
+            Err(e) => error!("Failed to send follow-up to {}: {e}", room.room_id()),
+        }
     }
 }
 
@@ -1675,10 +2017,13 @@ mod tests {
 
     #[test]
     fn relative_date_always_shows_weekday_and_date() {
-        assert_eq!(format_relative_date(today(), today()), "Mon, 20 Jul");
+        assert_eq!(
+            format_relative_date(today(), today()),
+            "Mon, 20 Jul (today)"
+        );
         assert_eq!(
             format_relative_date(today() + chrono::Duration::days(1), today()),
-            "Tue, 21 Jul"
+            "Tue, 21 Jul (tomorrow)"
         );
         assert_eq!(
             format_relative_date(today() + chrono::Duration::days(6), today()),
@@ -1800,7 +2145,7 @@ mod tests {
             },
         ];
 
-        let (plain, html) = build_reminder(&pickups, date, &reminder_colors());
+        let (plain, html) = build_reminder(&pickups, date, &reminder_colors(), None);
 
         assert_eq!(
             plain,
@@ -1831,7 +2176,7 @@ mod tests {
             },
         ];
 
-        let (plain, html) = build_reminder(&pickups, date, &reminder_colors());
+        let (plain, html) = build_reminder(&pickups, date, &reminder_colors(), None);
 
         assert_eq!(
             plain,
@@ -1855,7 +2200,7 @@ mod tests {
         assert!(plain.starts_with("🗑️ Next collections\n\n"));
         assert_eq!(plain.lines().count(), 5); // header + blank + 3 entries
         assert!(!plain.contains('|')); // no table-like formatting
-        assert!(plain.contains("🟤 Organic · Tue, 21 Jul"));
+        assert!(plain.contains("🟤 Organic · Tue, 21 Jul (tomorrow)"));
         assert!(plain.contains("🔵 Paper · Fri, 24 Jul"));
         assert!(plain.contains("⚫ Residual · Mon, 27 Jul"));
 
@@ -1868,7 +2213,7 @@ mod tests {
     fn unknown_waste_color_falls_back_to_generic_trash_emoji() {
         let pickups = vec![pickup(1, "Mystery")];
         let (plain, _) = render_garbage_list("Next collections", &pickups, today(), &colors());
-        assert!(plain.contains("🗑️ Mystery · Tue, 21 Jul"));
+        assert!(plain.contains("🗑️ Mystery · Tue, 21 Jul (tomorrow)"));
     }
 
     #[test]
@@ -2396,10 +2741,181 @@ mod tests {
         assert!(health.last_success.is_none());
     }
 
-    fn uuid_ish() -> u128 {
-        std::time::SystemTime::now()
+    /// Unique per call: tests run in parallel, and two of them reading the
+    /// clock in the same nanosecond used to share one state file.
+    fn uuid_ish() -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos();
+        format!("{}-{nanos}-{n}", std::process::id())
+    }
+
+    // ── Confirmations and follow-up ───────────────────────────────────────────
+
+    fn posted_at(sent_at: DateTime<chrono::Utc>, date: NaiveDate) -> PostedReminder {
+        PostedReminder {
+            date,
+            pickups: vec![Pickup {
+                date,
+                label: "Paper (blue)".to_owned(),
+            }],
+            event_ids: HashMap::from([("!a:x".to_owned(), "$evt".to_owned())]),
+            sent_at,
+            confirmations: Vec::new(),
+            followup_sent: false,
+        }
+    }
+
+    fn berlin(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<chrono::Utc> {
+        REMINDER_TZ
+            .with_ymd_and_hms(y, m, d, h, min, 0)
+            .unwrap()
+            .to_utc()
+    }
+
+    #[test]
+    fn confirmed_reminder_replaces_call_to_action_with_who_did_it() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let mut posted = posted_at(berlin(2026, 8, 9, 20, 0), date);
+        assert!(add_confirmation(
+            &mut posted,
+            "@a:x",
+            "Alice",
+            berlin(2026, 8, 9, 21, 14)
+        ));
+        assert!(!add_confirmation(
+            &mut posted,
+            "@a:x",
+            "Alice",
+            berlin(2026, 8, 9, 21, 20)
+        ));
+        assert!(add_confirmation(
+            &mut posted,
+            "@b:x",
+            "Bob <3",
+            berlin(2026, 8, 9, 21, 30)
+        ));
+
+        let names = posted.confirmed_by().unwrap();
+        let (plain, html) = build_reminder(&posted.pickups, date, &reminder_colors(), Some(&names));
+
+        assert!(plain.ends_with("✅ Done — Alice (21:14), Bob <3 (21:30)"));
+        assert!(!plain.contains("@room"));
+        assert!(html.ends_with("✅ <strong>Done</strong> — Alice (21:14), Bob &lt;3 (21:30)"));
+    }
+
+    #[test]
+    fn followup_is_due_once_when_nobody_confirmed() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let after = chrono::Duration::minutes(120);
+        let mut posted = posted_at(berlin(2026, 8, 9, 20, 0), date);
+
+        assert_eq!(
+            followup_due_at(&posted, after),
+            Some(berlin(2026, 8, 9, 22, 0))
+        );
+
+        posted.followup_sent = true;
+        assert_eq!(followup_due_at(&posted, after), None);
+
+        posted.followup_sent = false;
+        add_confirmation(&mut posted, "@a:x", "Alice", berlin(2026, 8, 9, 21, 0));
+        assert_eq!(followup_due_at(&posted, after), None);
+    }
+
+    #[test]
+    fn no_followup_once_collection_morning_has_started() {
+        // A reminder recovered late at 05:00 on collection day would nudge
+        // at 07:00 — after the crews have come.
+        let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let posted = posted_at(berlin(2026, 8, 10, 5, 0), date);
+
+        assert_eq!(
+            followup_due_at(&posted, chrono::Duration::minutes(120)),
+            None
+        );
+    }
+
+    #[test]
+    fn followup_says_this_morning_after_midnight() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let posted = posted_at(berlin(2026, 8, 9, 23, 0), date);
+        let evening = berlin(2026, 8, 9, 23, 30).with_timezone(&REMINDER_TZ);
+        let night = berlin(2026, 8, 10, 1, 0).with_timezone(&REMINDER_TZ);
+
+        assert!(followup_text(&posted, evening)
+            .0
+            .contains("tomorrow morning"));
+        assert!(followup_text(&posted, night).0.contains("this morning"));
+    }
+
+    #[test]
+    fn record_posted_extends_the_same_reminder_and_replaces_an_older_one() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let mut persisted = PersistedState::default();
+        let pickups = vec![pickup(1, "Paper")];
+
+        record_posted(
+            &mut persisted,
+            &pickups,
+            date,
+            vec![("!a:x".into(), "$1".into())],
+        );
+        add_confirmation(
+            persisted.posted.as_mut().unwrap(),
+            "@a:x",
+            "Alice",
+            reminder_now_utc(),
+        );
+        record_posted(
+            &mut persisted,
+            &pickups,
+            date,
+            vec![("!b:x".into(), "$2".into())],
+        );
+
+        let posted = persisted.posted.as_ref().unwrap();
+        assert_eq!(posted.event_ids.len(), 2);
+        assert_eq!(posted.confirmations.len(), 1);
+        assert!(posted.is_reminder_event("$2"));
+
+        let next = date + chrono::Duration::days(7);
+        record_posted(
+            &mut persisted,
+            &pickups,
+            next,
+            vec![("!a:x".into(), "$3".into())],
+        );
+        let posted = persisted.posted.as_ref().unwrap();
+        assert_eq!(posted.date, next);
+        assert!(posted.confirmations.is_empty());
+        assert!(!posted.is_reminder_event("$1"));
+
+        record_posted(&mut persisted, &pickups, next, Vec::new());
+        assert_eq!(persisted.posted.as_ref().unwrap().event_ids.len(), 1);
+    }
+
+    #[test]
+    fn status_shows_confirmation_state_of_the_last_reminder() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let mut persisted = PersistedState {
+            last_sent_date: Some(date),
+            posted: Some(posted_at(berlin(2026, 8, 9, 20, 0), date)),
+            ..Default::default()
+        };
+        assert_eq!(
+            describe_reminder_state(&persisted),
+            "last sent 2026-08-10 · no ✅ yet"
+        );
+
+        let posted = persisted.posted.as_mut().unwrap();
+        add_confirmation(posted, "@a:x", "Alice", berlin(2026, 8, 9, 21, 14));
+        assert_eq!(
+            describe_reminder_state(&persisted),
+            "last sent 2026-08-10 · ✅ Alice (21:14)"
+        );
     }
 }

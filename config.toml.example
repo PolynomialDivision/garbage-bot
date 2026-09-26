@@ -41,6 +41,10 @@ reminder_time = "20:00"
 # tonight" message would just be misleading, so it's dropped and logged
 # instead of delivered late.
 # max_lateness_minutes = 720
+# If nobody has reacted with ✅ this many minutes after the reminder, the bot
+# posts one follow-up as a reply to it (default: 120; 0 = never). No follow-up
+# is sent after 06:00 on collection day.
+# followup_minutes = 120
 
 [security]
 # Users allowed to run admin commands — in shared rooms and privately in a
