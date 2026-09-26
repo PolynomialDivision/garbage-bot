@@ -25,6 +25,7 @@ use mxbot_common::{
                     MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
                     RoomMessageEventContent,
                 },
+                room::redaction::OriginalSyncRoomRedactionEvent,
                 Mentions,
             },
             OwnedEventId, OwnedTransactionId, OwnedUserId,
@@ -402,6 +403,12 @@ struct PostedReminder {
     confirmations: Vec<Confirmation>,
     #[serde(default)]
     followup_sent: bool,
+    /// When the follow-up went out, so its wording can be re-rendered.
+    #[serde(default)]
+    followup_at: Option<DateTime<chrono::Utc>>,
+    /// Room ID → event ID of the follow-up in that room.
+    #[serde(default)]
+    followup_event_ids: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +416,10 @@ struct Confirmation {
     user_id: String,
     name: String,
     at: DateTime<chrono::Utc>,
+    /// The ✅-type reactions this user put on the reminder. Retracting the
+    /// last one withdraws the confirmation.
+    #[serde(default)]
+    reaction_ids: Vec<String>,
 }
 
 impl PostedReminder {
@@ -1079,6 +1090,8 @@ fn record_posted(
             sent_at: reminder_now_utc(),
             confirmations: Vec::new(),
             followup_sent: false,
+            followup_at: None,
+            followup_event_ids: HashMap::new(),
         }),
     };
     posted.event_ids.extend(delivered);
@@ -1704,6 +1717,20 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Retracted reactions
+    bot.client.add_event_handler({
+        let state = state.clone();
+        move |ev: OriginalSyncRoomRedactionEvent, room: Room| {
+            let state = state.clone();
+            async move {
+                if room.state() != RoomState::Joined || ev.sender == state.bot.user_id {
+                    return;
+                }
+                spawn_logged("redaction-handler", handle_redaction(state, ev));
+            }
+        }
+    });
+
     // Scheduler
     spawn_logged("reminder-scheduler", {
         let state = state.clone();
@@ -1763,8 +1790,17 @@ async fn handle_reaction(state: BotState, room: Room, ev: OriginalSyncReactionEv
         else {
             return;
         };
-        if !add_confirmation(posted, ev.sender.as_str(), &name, reminder_now_utc()) {
-            return; // already confirmed
+        let reaction_id = ev.event_id.to_string();
+        if !add_confirmation(
+            posted,
+            ev.sender.as_str(),
+            &name,
+            reminder_now_utc(),
+            &reaction_id,
+        ) {
+            // Already confirmed; the extra reaction is remembered for retraction.
+            save_persisted_state(&state.reminder_state_path, &persisted).await;
+            return;
         }
         let posted = posted.clone();
         save_persisted_state(&state.reminder_state_path, &persisted).await;
@@ -1778,22 +1814,70 @@ async fn handle_reaction(state: BotState, room: Room, ev: OriginalSyncReactionEv
     edit_reminder_messages(&state).await;
 }
 
-/// Record that `user_id` confirmed; false if they already had.
+/// Record a ✅ from `user_id`; true if this made them a new confirmer
+/// (a second ✅-type reaction from them is only remembered for retraction).
 fn add_confirmation(
     posted: &mut PostedReminder,
     user_id: &str,
     name: &str,
     at: DateTime<chrono::Utc>,
+    reaction_id: &str,
 ) -> bool {
-    if posted.confirmations.iter().any(|c| c.user_id == user_id) {
+    if let Some(existing) = posted
+        .confirmations
+        .iter_mut()
+        .find(|c| c.user_id == user_id)
+    {
+        existing.reaction_ids.push(reaction_id.to_owned());
         return false;
     }
     posted.confirmations.push(Confirmation {
         user_id: user_id.to_owned(),
         name: name.to_owned(),
         at,
+        reaction_ids: vec![reaction_id.to_owned()],
     });
     true
+}
+
+/// Forget a retracted reaction; true if its user thereby no longer confirms.
+fn remove_confirmation_reaction(posted: &mut PostedReminder, reaction_id: &str) -> bool {
+    let Some(index) = posted
+        .confirmations
+        .iter()
+        .position(|c| c.reaction_ids.iter().any(|id| id == reaction_id))
+    else {
+        return false;
+    };
+    let confirmation = &mut posted.confirmations[index];
+    confirmation.reaction_ids.retain(|id| id != reaction_id);
+    if confirmation.reaction_ids.is_empty() {
+        posted.confirmations.remove(index);
+        return true;
+    }
+    false
+}
+
+/// A retracted ✅ on the current reminder takes the confirmation back.
+async fn handle_redaction(state: BotState, ev: OriginalSyncRoomRedactionEvent) {
+    let Some(redacted) = ev.content.redacts.clone().or_else(|| ev.redacts.clone()) else {
+        return;
+    };
+    let withdrawn = {
+        let mut persisted = state.persisted.lock().await;
+        let Some(posted) = persisted.posted.as_mut() else {
+            return;
+        };
+        if !remove_confirmation_reaction(posted, redacted.as_str()) {
+            save_persisted_state(&state.reminder_state_path, &persisted).await;
+            return;
+        }
+        let date = posted.date;
+        save_persisted_state(&state.reminder_state_path, &persisted).await;
+        date
+    };
+    info!("{} withdrew their confirmation for {withdrawn}", ev.sender);
+    edit_reminder_messages(&state).await;
 }
 
 /// Rewrite the reminder in every room to show who confirmed. An edit instead
@@ -1833,6 +1917,30 @@ async fn edit_reminder_messages(state: &BotState) {
             error!("Failed to update reminder in {}: {e}", room.room_id());
         }
     }
+
+    // The follow-up should not keep saying "nobody has confirmed".
+    let Some(followup_at) = posted.followup_at else {
+        return;
+    };
+    let (plain, html) = followup_text(&posted, followup_at.with_timezone(&REMINDER_TZ));
+    for room in state.bot.broadcast_rooms() {
+        let Some(event_id) = posted
+            .followup_event_ids
+            .get(room.room_id().as_str())
+            .and_then(|id| id.parse::<OwnedEventId>().ok())
+        else {
+            continue;
+        };
+        let content = RoomMessageEventContent::text_html(plain.clone(), html.clone())
+            .add_mentions(Mentions::with_room_mention())
+            .make_replacement(ReplacementMetadata::new(
+                event_id,
+                Some(Mentions::with_room_mention()),
+            ));
+        if let Err(e) = room.send(content).await {
+            error!("Failed to update follow-up in {}: {e}", room.room_id());
+        }
+    }
 }
 
 // ── Follow-up when nobody confirmed ──────────────────────────────────────────
@@ -1861,7 +1969,14 @@ fn followup_due_at(
     (due < deadline.to_utc()).then_some(due)
 }
 
+/// The follow-up as posted at `now`, or — once someone confirmed — turned
+/// into a short all-clear so it no longer claims nobody did.
 fn followup_text(posted: &PostedReminder, now: DateTime<Tz>) -> (String, String) {
+    if let Some(names) = posted.confirmed_by() {
+        let plain = format!("✅ Bins are out — thanks, {names}!");
+        let html = format!("✅ Bins are out — thanks, {}!", escape_html(&names));
+        return (plain, html);
+    }
     let when = if now.date_naive() >= posted.date {
         "this morning"
     } else {
@@ -1894,6 +2009,7 @@ async fn maybe_send_followup(state: &BotState) {
         }
         // Marked before sending: one follow-up at most, even if a send fails.
         posted.followup_sent = true;
+        posted.followup_at = Some(now.to_utc());
         let posted = posted.clone();
         save_persisted_state(&state.reminder_state_path, &persisted).await;
         posted
@@ -1914,7 +2030,17 @@ async fn maybe_send_followup(state: &BotState) {
         let transaction_id: OwnedTransactionId =
             format!("garbage-followup-{}-{}", posted.date, room.room_id()).into();
         match room.send(content).with_transaction_id(transaction_id).await {
-            Ok(_) => info!("Follow-up sent to {} for {}", room.room_id(), posted.date),
+            Ok(resp) => {
+                info!("Follow-up sent to {} for {}", room.room_id(), posted.date);
+                let mut persisted = state.persisted.lock().await;
+                if let Some(current) = persisted.posted.as_mut().filter(|p| p.date == posted.date) {
+                    current.followup_event_ids.insert(
+                        room.room_id().to_string(),
+                        resp.response.event_id.to_string(),
+                    );
+                    save_persisted_state(&state.reminder_state_path, &persisted).await;
+                }
+            }
             Err(e) => error!("Failed to send follow-up to {}: {e}", room.room_id()),
         }
     }
@@ -2766,6 +2892,8 @@ mod tests {
             sent_at,
             confirmations: Vec::new(),
             followup_sent: false,
+            followup_at: None,
+            followup_event_ids: HashMap::new(),
         }
     }
 
@@ -2784,19 +2912,22 @@ mod tests {
             &mut posted,
             "@a:x",
             "Alice",
-            berlin(2026, 8, 9, 21, 14)
+            berlin(2026, 8, 9, 21, 14),
+            "$r1"
         ));
         assert!(!add_confirmation(
             &mut posted,
             "@a:x",
             "Alice",
-            berlin(2026, 8, 9, 21, 20)
+            berlin(2026, 8, 9, 21, 20),
+            "$r2"
         ));
         assert!(add_confirmation(
             &mut posted,
             "@b:x",
             "Bob <3",
-            berlin(2026, 8, 9, 21, 30)
+            berlin(2026, 8, 9, 21, 30),
+            "$r3"
         ));
 
         let names = posted.confirmed_by().unwrap();
@@ -2822,7 +2953,13 @@ mod tests {
         assert_eq!(followup_due_at(&posted, after), None);
 
         posted.followup_sent = false;
-        add_confirmation(&mut posted, "@a:x", "Alice", berlin(2026, 8, 9, 21, 0));
+        add_confirmation(
+            &mut posted,
+            "@a:x",
+            "Alice",
+            berlin(2026, 8, 9, 21, 0),
+            "$r4",
+        );
         assert_eq!(followup_due_at(&posted, after), None);
     }
 
@@ -2869,6 +3006,7 @@ mod tests {
             "@a:x",
             "Alice",
             reminder_now_utc(),
+            "$r5",
         );
         record_posted(
             &mut persisted,
@@ -2912,10 +3050,64 @@ mod tests {
         );
 
         let posted = persisted.posted.as_mut().unwrap();
-        add_confirmation(posted, "@a:x", "Alice", berlin(2026, 8, 9, 21, 14));
+        add_confirmation(posted, "@a:x", "Alice", berlin(2026, 8, 9, 21, 14), "$r6");
         assert_eq!(
             describe_reminder_state(&persisted),
             "last sent 2026-08-10 · ✅ Alice (21:14)"
         );
+    }
+
+    #[test]
+    fn retracting_the_last_check_withdraws_the_confirmation() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let mut posted = posted_at(berlin(2026, 8, 9, 20, 0), date);
+        let at = berlin(2026, 8, 9, 21, 0);
+        add_confirmation(&mut posted, "@a:x", "Alice", at, "$check");
+        add_confirmation(&mut posted, "@a:x", "Alice", at, "$tick"); // ✅ and ✔
+        add_confirmation(&mut posted, "@b:x", "Bob", at, "$bob");
+
+        assert!(!remove_confirmation_reaction(&mut posted, "$check"));
+        assert_eq!(posted.confirmations.len(), 2);
+        assert!(remove_confirmation_reaction(&mut posted, "$tick"));
+        assert_eq!(posted.confirmed_by().unwrap(), "Bob (21:00)");
+        assert!(!remove_confirmation_reaction(&mut posted, "$unrelated"));
+        assert!(remove_confirmation_reaction(&mut posted, "$bob"));
+        assert!(posted.confirmed_by().is_none());
+
+        let (plain, _) = build_reminder(&posted.pickups, date, &reminder_colors(), None);
+        assert!(plain.ends_with("✅ when done"));
+    }
+
+    #[test]
+    fn followup_turns_into_an_all_clear_once_confirmed() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let mut posted = posted_at(berlin(2026, 8, 9, 20, 0), date);
+        let at = berlin(2026, 8, 9, 22, 0).with_timezone(&REMINDER_TZ);
+        assert!(followup_text(&posted, at).0.starts_with("⏰ @room Nobody"));
+
+        add_confirmation(
+            &mut posted,
+            "@a:x",
+            "Alice <3",
+            berlin(2026, 8, 9, 22, 5),
+            "$r",
+        );
+        let (plain, html) = followup_text(&posted, at);
+
+        assert_eq!(plain, "✅ Bins are out — thanks, Alice <3 (22:05)!");
+        assert!(html.contains("Alice &lt;3"));
+    }
+
+    #[test]
+    fn state_written_before_followup_tracking_still_loads() {
+        let json = r#"{"date":"2026-08-10","pickups":[],"event_ids":{"!a:x":"$1"},
+            "sent_at":"2026-08-09T18:00:00Z",
+            "confirmations":[{"user_id":"@a:x","name":"A","at":"2026-08-09T19:00:00Z"}],
+            "followup_sent":true}"#;
+
+        let posted: PostedReminder = serde_json::from_str(json).unwrap();
+
+        assert!(posted.followup_at.is_none());
+        assert!(posted.confirmations[0].reaction_ids.is_empty());
     }
 }
