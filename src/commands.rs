@@ -6,19 +6,19 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GarbageCommand {
-    /// `!garbage` — next upcoming pickup for each waste type.
+    /// `!garbage`: next upcoming pickup for each waste type.
     NextPerType,
-    /// `!garbage next` — only the single nearest pickup event.
+    /// `!garbage next`: only the single nearest pickup event.
     NextEvent,
-    /// `!garbage week` — every pickup in the next 7 days.
+    /// `!garbage week`: every pickup in the next 7 days.
     Week,
-    /// `!garbage status` — source health, reminder/scheduler state.
+    /// `!garbage status`: source health, reminder/scheduler state.
     Status,
-    /// `!garbage refresh` (admin-only) — force a schedule refresh now.
+    /// `!garbage refresh` (admin-only): force a schedule refresh now.
     Refresh,
-    /// `!garbage version` — deployed build version.
+    /// `!garbage version`: deployed build version.
     Version,
-    /// `!garbage help` (or an unrecognized subcommand) — usage text.
+    /// `!garbage help` (or an unrecognized subcommand): usage text.
     Help,
 }
 
@@ -39,7 +39,7 @@ pub(crate) fn parse_garbage_command(body: &str) -> Option<GarbageCommand> {
     })
 }
 
-/// Remove duplicate (date, label) pairs — the BSR and Berlin Recycling feeds
+/// Remove duplicate (date, label) pairs. The BSR and Berlin Recycling feeds
 /// can list the same pickup twice if their configured labels collide.
 pub(crate) fn dedup_pickups(pickups: Vec<Pickup>) -> Vec<Pickup> {
     let mut seen: HashSet<(NaiveDate, String)> = HashSet::new();
@@ -129,17 +129,18 @@ pub(crate) fn escape_html(s: &str) -> String {
 }
 
 pub(crate) fn garbage_empty_message() -> (String, String) {
-    let text = "🗑️ No upcoming collections found.".to_owned();
+    let text = "🤷 No upcoming pickups found.".to_owned();
     (text.clone(), text)
 }
 
 pub(crate) fn garbage_help_message() -> (String, String) {
-    let plain = "🗑️ !garbage — next per type\n\
-                  !garbage next — next collection\n\
-                  !garbage week — next 7 days\n\
-                  !garbage status — source/reminder health\n\
-                  !garbage refresh — force refresh (admin)\n\
-                  !garbage version — build version"
+    let plain = "🗑️ Garbage commands\n\
+                 📋 !garbage: next per type\n\
+                 ⏭️ !garbage next: next pickup\n\
+                 📆 !garbage week: next 7 days\n\
+                 🩺 !garbage status: source health\n\
+                 🔄 !garbage refresh: reload (admin)\n\
+                 🏷️ !garbage version: build version"
         .to_owned();
     let html = plain.replace('\n', "<br>");
     (plain, html)
@@ -190,7 +191,7 @@ pub(crate) fn describe_reminder_state(persisted: &PersistedState) -> String {
         None => base,
     };
     match persisted.last_expired_date {
-        Some(d) => format!("{base} · ⚠ {d} expired unsent"),
+        Some(d) => format!("{base} · ⚠️ {d} expired unsent"),
         None => base,
     }
 }
@@ -199,19 +200,22 @@ pub(crate) async fn build_status_message(state: &BotState) -> (String, String) {
     let persisted = state.persisted.lock().await;
     let bsr_health = state.bsr_health.lock().await.clone();
 
-    let mut lines = vec!["🗑️ Status".to_owned()];
+    let mut lines = vec!["🩺 Garbage status".to_owned()];
     lines.push(format!(
-        "BSR: {}",
+        "♻️ BSR: {}",
         describe_source_health(&bsr_health, persisted.bsr_cache.len())
     ));
     if state.berlin_recycling_creds.is_some() {
         let br_health = state.br_health.lock().await.clone();
         lines.push(format!(
-            "Paper: {}",
+            "📄 Paper: {}",
             describe_source_health(&br_health, persisted.br_cache.len())
         ));
     }
-    lines.push(format!("Reminder: {}", describe_reminder_state(&persisted)));
+    lines.push(format!(
+        "⏰ Reminder: {}",
+        describe_reminder_state(&persisted)
+    ));
 
     let plain = lines.join("\n");
     let html = escape_html(&plain).replace('\n', "<br>");
@@ -292,7 +296,7 @@ pub(crate) async fn handle_garbage_command(
         GarbageCommand::Status => build_status_message(&state).await,
         GarbageCommand::Refresh => {
             if !state.bot.is_admin(&sender) {
-                let msg = "⛔ Admin only.".to_owned();
+                let msg = "⛔ Only admins can do that.".to_owned();
                 (msg.clone(), msg)
             } else {
                 info!("!garbage refresh requested by {sender}");

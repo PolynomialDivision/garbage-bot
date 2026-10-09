@@ -4,10 +4,10 @@ use super::*;
 
 /// Resolve a naive local wall-clock time against a timezone, handling the two
 /// DST edge cases `TimeZone::from_local_datetime` can return:
-/// - "spring forward" gap (e.g. 02:30 doesn't exist) — nudge forward until it
+/// - "spring forward" gap (e.g. 02:30 doesn't exist), nudge forward until it
 ///   resolves, so a reminder time that falls in the gap fires slightly late
 ///   instead of never firing.
-/// - "fall back" overlap (e.g. 02:30 happens twice) — pick the earlier
+/// - "fall back" overlap (e.g. 02:30 happens twice), pick the earlier
 ///   occurrence, so the reminder fires at the first opportunity.
 pub(crate) fn resolve_local<Tz: TimeZone>(tz: &Tz, naive: chrono::NaiveDateTime) -> DateTime<Tz> {
     match tz.from_local_datetime(&naive) {
@@ -33,7 +33,7 @@ pub(crate) fn resolve_local<Tz: TimeZone>(tz: &Tz, naive: chrono::NaiveDateTime)
 }
 
 /// The next instant `target_time` occurs at or after `now`, in `now`'s
-/// timezone — today if `target_time` hasn't passed yet, otherwise tomorrow.
+/// timezone: today if `target_time` hasn't passed yet, otherwise tomorrow.
 /// DST-aware: computed via `resolve_local` rather than naive datetime
 /// subtraction, which would be off by an hour on the two DST-transition days.
 pub(crate) fn next_reminder_datetime<Tz: TimeZone>(
@@ -50,7 +50,7 @@ pub(crate) fn next_reminder_datetime<Tz: TimeZone>(
 }
 
 /// Bounded exponential backoff for reminder-delivery retries: 5s, 10s, 20s...
-/// capped at 5 minutes. Deliberately has no max-attempt cutoff — a reminder
+/// capped at 5 minutes. Deliberately has no max-attempt cutoff. A reminder
 /// must keep retrying until delivered, not give up and disappear.
 pub(crate) fn backoff_delay(attempt: u32) -> Duration {
     let secs = 5u64.saturating_mul(1u64 << attempt.min(6));
@@ -58,7 +58,7 @@ pub(crate) fn backoff_delay(attempt: u32) -> Duration {
 }
 
 /// Whether a pending reminder has been retrying for longer than
-/// `max_lateness` — the bounded counterpart to `backoff_delay`'s unbounded
+/// `max_lateness`: the bounded counterpart to `backoff_delay`'s unbounded
 /// attempt count. Retries are unlimited *in number* but not in *time*: past
 /// this point the reminder's "put them out tonight" content is actively
 /// wrong, so delivering it would mislead rather than help.
@@ -89,7 +89,7 @@ pub(crate) fn rooms_pending_delivery(
 }
 
 /// True once every currently-joined room has received the reminder. False
-/// (not true) if there are no joined rooms at all — nothing has actually been
+/// (not true) if there are no joined rooms at all. Nothing has actually been
 /// delivered yet, so it must not be mistaken for "done".
 pub(crate) fn is_fully_delivered(pending: &PendingReminder, joined_room_ids: &[String]) -> bool {
     !joined_room_ids.is_empty()
@@ -181,7 +181,7 @@ pub(crate) async fn resolve_pending_reminder(state: &BotState) {
     let now = reminder_now();
     if is_pending_expired(&pending, now, state.max_lateness()) {
         error!(
-            "Reminder for {} expired unsent: still pending after {}, {}/{} room(s) confirmed, {} attempt(s) — giving up rather than deliver stale \"put them out tonight\" info",
+            "Reminder for {} expired unsent: still pending after {}, {}/{} room(s) confirmed, {} attempt(s): giving up rather than deliver stale \"put them out tonight\" info",
             pending.date,
             format_duration_minutes(now.to_utc() - pending.created_at),
             pending.sent_room_ids.len(),
@@ -201,7 +201,7 @@ pub(crate) async fn resolve_pending_reminder(state: &BotState) {
 
     if joined_ids.is_empty() {
         warn!(
-            "Reminder for {} still pending — no joined rooms yet (attempt {})",
+            "Reminder for {} still pending, no joined rooms yet (attempt {})",
             pending.date,
             pending.attempt + 1
         );
@@ -284,7 +284,7 @@ pub(crate) fn record_posted(
 }
 
 /// If a new reminder is due, fetch the schedule and persist it as pending
-/// *before* attempting any send — so a crash right after this still leaves a
+/// *before* attempting any send, so a crash right after this still leaves a
 /// recoverable record on restart. `resolve_pending_reminder` does the actual
 /// sending, whether called right after this or on a later retry/restart.
 pub(crate) async fn maybe_start_reminder(state: &BotState, target_time: NaiveTime) {
@@ -354,7 +354,7 @@ pub(crate) async fn run_scheduler(state: BotState) {
     );
     loop {
         // Order matters: create today's pending reminder first (if due), then
-        // attempt delivery in the same tick — a freshly-created reminder
+        // attempt delivery in the same tick. A freshly-created reminder
         // doesn't wait for the next tick just to make its first send attempt.
         // Re-read each tick: admins can change the time at runtime.
         let target_time = state.reminder_time();
@@ -398,7 +398,7 @@ pub(crate) async fn run_scheduler(state: BotState) {
 
 /// One-shot `--test` path: send the next upcoming reminder immediately and
 /// don't loop. Deliberately does not touch `state.persisted`'s pending/sent
-/// tracking — it's a manual dev trigger, not part of the daily production
+/// tracking: it's a manual dev trigger, not part of the daily production
 /// cadence, and shouldn't affect what the real scheduler considers "already
 /// sent".
 pub(crate) async fn send_test_reminder(state: &BotState) {
@@ -424,7 +424,7 @@ pub(crate) async fn send_test_reminder(state: &BotState) {
             break joined;
         }
         if tries >= 60 {
-            warn!("No joined rooms after 30s — bot not invited yet?");
+            warn!("No joined rooms after 30s, bot not invited yet?");
             return;
         }
         sleep(Duration::from_millis(500)).await;

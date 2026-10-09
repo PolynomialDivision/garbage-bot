@@ -84,7 +84,7 @@ pub(crate) async fn resolve_schedule_id(
         return Ok(results[0].value.clone());
     }
 
-    // Multiple results — log them all so the user can identify the right one.
+    // Multiple results: log them all so the user can identify the right one.
     info!(
         "Multiple BSR addresses found for {} {}:",
         matched.value, number
@@ -98,7 +98,7 @@ pub(crate) async fn resolve_schedule_id(
         if let Some(entry) = results.iter().find(|e| e.label.contains(plz)) {
             return Ok(entry.value.clone());
         }
-        warn!("PLZ {plz} not found in any result — falling back to first entry");
+        warn!("PLZ {plz} not found in any result, falling back to first entry");
     }
 
     Ok(results[0].value.clone())
@@ -147,7 +147,7 @@ pub(crate) async fn fetch_berlin_recycling_pickups(
     password: &str,
     waste_labels: &HashMap<String, String>,
 ) -> Result<Vec<Pickup>> {
-    // Each call creates a fresh session — the portal is stateful via cookies.
+    // Each call creates a fresh session. The portal is stateful via cookies.
     let http = reqwest::Client::builder()
         .cookie_store(true)
         .timeout(HTTP_TIMEOUT)
@@ -173,7 +173,7 @@ pub(crate) async fn fetch_berlin_recycling_pickups(
     let check = http.get(format!("{BR_PORTAL}Default.aspx")).send().await?;
     if check.url().host_str() != Some("kundenportal.berlin-recycling.de") {
         return Err(anyhow!(
-            "Berlin Recycling login failed — redirected to {}",
+            "Berlin Recycling login failed: redirected to {}",
             check.url()
         ));
     }
@@ -244,7 +244,7 @@ pub(crate) async fn fetch_berlin_recycling_pickups(
 /// previously-seen upcoming ones for that source. Past entries (before
 /// `today`) are dropped so the cache doesn't grow forever; everything else
 /// survives even if `fetched` is empty (failed refresh) or no longer lists a
-/// date the cache already had — a source is never allowed to make a known
+/// date the cache already had. A source is never allowed to make a known
 /// pickup disappear, only for it to age out once its date has passed.
 pub(crate) fn merge_pickup_cache(
     cache: &[Pickup],
@@ -271,7 +271,7 @@ pub(crate) fn merge_pickup_cache(
 /// have skipped every other source too.
 /// Refresh one source's cache from the outcome of a fetch attempt: on success,
 /// merge the fresh data and reset failure tracking; on failure, merge an empty
-/// fetch (a no-op except pruning past dates — see `merge_pickup_cache`) and
+/// fetch (a no-op except pruning past dates, see `merge_pickup_cache`) and
 /// record the error. Shared by BSR and Berlin Recycling so the "never wipe a
 /// known-good schedule" behavior lives in exactly one place.
 pub(crate) fn apply_fetch_outcome(

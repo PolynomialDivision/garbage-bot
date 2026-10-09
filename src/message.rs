@@ -93,18 +93,17 @@ pub(crate) fn build_reminder(
 
     let (footer_plain, footer_html) = match confirmed_by {
         Some(names) => (
-            format!("✅ Done — {names}"),
-            format!("✅ <strong>Done</strong> — {}", escape_html(names)),
+            format!("✅ Done by {names}"),
+            format!("✅ <strong>Done</strong> by {}", escape_html(names)),
         ),
-        None => {
-            let footer = format!("@room · Put the {bin_word} out tonight · ✅ when done");
-            (footer.clone(), footer)
-        }
+        None => (
+            format!("@room 🌙 Put the {bin_word} out tonight.\n👉 Tap ✅ when done."),
+            format!("@room 🌙 Put the {bin_word} out tonight.<br>👉 Tap ✅ when done."),
+        ),
     };
-    let plain =
-        format!("📢 Garbage reminder for tomorrow\n{day}\n\n{plain_bins}\n\n{footer_plain}");
+    let plain = format!("🚛 Garbage pickup tomorrow\n📅 {day}\n\n{plain_bins}\n\n{footer_plain}");
     let html = format!(
-        "📢 <strong>Garbage reminder for tomorrow</strong><br><strong>{day}</strong><br><br>{html_bins}<br><br>{footer_html}"
+        "🚛 <strong>Garbage pickup tomorrow</strong><br>📅 <strong>{day}</strong><br><br>{html_bins}<br><br>{footer_html}"
     );
     (plain, html)
 }

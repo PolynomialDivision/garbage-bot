@@ -5,7 +5,7 @@ use super::*;
 // ── Reaction handler ──────────────────────────────────────────────────────────
 
 pub(crate) async fn handle_reaction(state: BotState, room: Room, ev: OriginalSyncReactionEvent) {
-    // Ignore the bot's own seed reaction — it only exists to show users the button.
+    // Ignore the bot's own seed reaction. It only exists to show users the button.
     if ev.sender == state.bot.user_id {
         return;
     }
@@ -133,7 +133,7 @@ pub(crate) async fn handle_redaction(state: BotState, ev: OriginalSyncRoomRedact
 }
 
 /// Rewrite the reminder in every room to show who confirmed. An edit instead
-/// of a new message: the room sees the reminder turn into "✅ Done — Alice"
+/// of a new message: the room sees the reminder turn into "✅ Done by Alice"
 /// without another notification.
 pub(crate) async fn edit_reminder_messages(state: &BotState) {
     let _serialized = state.edit_lock.lock().await;
@@ -221,12 +221,12 @@ pub(crate) fn followup_due_at(
     (due < deadline.to_utc()).then_some(due)
 }
 
-/// The follow-up as posted at `now`, or — once someone confirmed — turned
+/// The follow-up as posted at `now`, or (once someone confirmed) turned
 /// into a short all-clear so it no longer claims nobody did.
 pub(crate) fn followup_text(posted: &PostedReminder, now: DateTime<Tz>) -> (String, String) {
     if let Some(names) = posted.confirmed_by() {
-        let plain = format!("✅ Bins are out — thanks, {names}!");
-        let html = format!("✅ Bins are out — thanks, {}!", escape_html(&names));
+        let plain = format!("✅ Bins are out. Thanks, {names}! 🙌");
+        let html = format!("✅ Bins are out. Thanks, {}! 🙌", escape_html(&names));
         return (plain, html);
     }
     let when = if now.date_naive() >= posted.date {
@@ -235,10 +235,12 @@ pub(crate) fn followup_text(posted: &PostedReminder, now: DateTime<Tz>) -> (Stri
         "tomorrow morning"
     };
     let plain = format!(
-        "⏰ @room Nobody has confirmed the bins yet — collection is {when}. \
-         Tap ✅ on the reminder once they're out."
+        "⏰ @room Nobody has confirmed the bins yet.\n\
+         🚛 Pickup is {when}.\n\
+         👉 Tap ✅ on the reminder once they're out."
     );
-    (plain.clone(), plain)
+    let html = plain.replace('\n', "<br>");
+    (plain, html)
 }
 
 /// Post the follow-up once, as a reply to the reminder in each room.

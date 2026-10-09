@@ -9,14 +9,14 @@ use super::*;
 // atomically (tmp file + rename) so a kill mid-write can't corrupt it.
 
 /// A reminder that has been decided (pickups + date) but may not yet be fully
-/// delivered to every joined room. Persisted as soon as it's created — before
-/// any send is attempted — so a crash between "decided" and "delivered" is
+/// delivered to every joined room. Persisted as soon as it's created (before
+/// any send is attempted) so a crash between "decided" and "delivered" is
 /// recovered on restart instead of silently losing the reminder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PendingReminder {
     pub(crate) date: NaiveDate,
     pub(crate) pickups: Vec<Pickup>,
-    /// Room IDs (as strings) that have already received this reminder —
+    /// Room IDs (as strings) that have already received this reminder:
     /// checked before every send attempt so retries and restarts never
     /// duplicate a delivery.
     #[serde(default)]
@@ -34,8 +34,8 @@ pub(crate) struct PendingReminder {
 }
 
 /// The most recent reminder that reached at least one room: where it was
-/// posted and who confirmed it. Persisted so ✅ taps keep working — and the
-/// follow-up stays suppressed — across restarts.
+/// posted and who confirmed it. Persisted so ✅ taps keep working (and the
+/// follow-up stays suppressed) across restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PostedReminder {
     pub(crate) date: NaiveDate,
@@ -71,7 +71,7 @@ impl PostedReminder {
         self.event_ids.values().any(|id| id == event_id)
     }
 
-    /// "Alice (21:14), Bob (21:20)" — who confirmed, in order.
+    /// "Alice (21:14), Bob (21:20)": who confirmed, in order.
     pub(crate) fn confirmed_by(&self) -> Option<String> {
         (!self.confirmations.is_empty()).then(|| {
             self.confirmations
@@ -96,7 +96,7 @@ pub(crate) struct PersistedState {
     #[serde(default)]
     pub(crate) br_cache: Vec<Pickup>,
     /// The most recent date whose "tomorrow" reminder has already been
-    /// evaluated (sent or found to have no pickups) — prevents refetching
+    /// evaluated (sent or found to have no pickups): prevents refetching
     /// and re-deciding every scheduler tick after the target time has passed
     /// for the day.
     #[serde(default)]
@@ -106,7 +106,7 @@ pub(crate) struct PersistedState {
     #[serde(default)]
     pub(crate) last_sent_date: Option<NaiveDate>,
     /// The most recent date whose reminder was given up on unsent after
-    /// exceeding `max_lateness` — surfaced in `!garbage status` so a silent
+    /// exceeding `max_lateness`: surfaced in `!garbage status` so a silent
     /// (but deliberate) non-delivery is still visible.
     #[serde(default)]
     pub(crate) last_expired_date: Option<NaiveDate>,
@@ -134,7 +134,7 @@ pub(crate) async fn load_persisted_state(path: &Path) -> PersistedState {
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => PersistedState::default(),
         Err(e) => {
-            error!("Failed to read reminder state file at {path:?} ({e}) — starting fresh.");
+            error!("Failed to read reminder state file at {path:?} ({e}): starting fresh.");
             PersistedState::default()
         }
     }
@@ -147,7 +147,7 @@ pub(crate) async fn save_persisted_state(path: &Path, state: &PersistedState) {
 }
 
 /// Operational health of one schedule source, for `!garbage status`/`refresh`.
-/// Intentionally not persisted — it's operational telemetry, not data that
+/// Intentionally not persisted. It's operational telemetry, not data that
 /// needs to survive a restart (the pickup caches inside `PersistedState` are
 /// what actually needs that guarantee).
 #[derive(Debug, Clone, Default)]
@@ -170,7 +170,7 @@ pub(crate) struct BotState {
     pub(crate) settings: Settings<ReminderSettings>,
     pub(crate) http: reqwest::Client,
     /// Path to the persisted reminder-state JSON file (not the store
-    /// *directory* — see `reminder_state_path` in `main`), on the same
+    /// *directory*: see `reminder_state_path` in `main`), on the same
     /// bind-mounted volume as the Matrix session store so it survives
     /// container restarts/recreation.
     pub(crate) reminder_state_path: PathBuf,

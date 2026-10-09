@@ -147,14 +147,14 @@ async fn main() -> Result<()> {
 
     let berlin_recycling_creds = config.berlin_recycling.map(|br| (br.username, br.password));
     if berlin_recycling_creds.is_some() {
-        info!("Berlin Recycling credentials configured — paper pickups enabled");
+        info!("Berlin Recycling credentials configured, paper pickups enabled");
     }
 
     let reminder_state_path = store_path.join("reminder_state.json");
     let persisted = load_persisted_state(&reminder_state_path).await;
     if let Some(ref pending) = persisted.pending_reminder {
         info!(
-            "Restart recovery: found pending reminder for {} (attempt {}, {} room(s) already confirmed) — will resume delivery",
+            "Restart recovery: found pending reminder for {} (attempt {}, {} room(s) already confirmed): will resume delivery",
             pending.date,
             pending.attempt,
             pending.sent_room_ids.len()

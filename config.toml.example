@@ -12,7 +12,7 @@ device_id = "YOUR_DEVICE_ID"
 
 [bsr]
 # Option A: let the bot resolve your schedule_id from your address at startup.
-# The resolved ID is logged — copy it into Option B for faster future startups.
+# The resolved ID is logged: copy it into Option B for faster future startups.
 street = "Musterstraße"
 number = "1"
 plz = "12345"
@@ -47,7 +47,7 @@ reminder_time = "20:00"
 # followup_minutes = 120
 
 [security]
-# Users allowed to run admin commands — in shared rooms and privately in a
+# Users allowed to run admin commands, privately in a
 # direct chat with the bot (send !admin there for help).
 admin_users = ["@you:matrix.org"]
 
@@ -56,9 +56,9 @@ admin_users = ["@you:matrix.org"]
 allowed_inviters = ["@you:matrix.org"]
 
 # Which devices receive room keys:
-#   identity_based  — only cross-signed devices (default, recommended)
-#   only_trusted    — only explicitly verified devices
-#   all_devices     — all devices, no restriction
+#   identity_based: only cross-signed devices (default, recommended)
+#   only_trusted: only explicitly verified devices
+#   all_devices: all devices, no restriction
 encryption_strategy = "all_devices"
 
 # Waste type labels (override to customise names shown in reminders)

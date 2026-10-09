@@ -39,7 +39,7 @@ pub(crate) struct ReminderConfig {
     #[serde(default = "default_reminder_time")]
     pub(crate) reminder_time: TimeOfDay,
     /// How long a reminder keeps retrying after becoming due before it's
-    /// given up on as stale. A reminder says "put them out tonight" — once
+    /// given up on as stale. A reminder says "put them out tonight". Once
     /// it's this late, that's no longer true, so delivering it would just be
     /// misleading rather than helpful.
     #[serde(default = "default_max_lateness_minutes")]

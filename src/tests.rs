@@ -126,7 +126,7 @@ fn relative_date_next_year_includes_year() {
 fn next_per_type_picks_earliest_future_date_per_label_and_sorts() {
     let pickups = vec![
         pickup(10, "Paper"),
-        pickup(-1, "Residual"), // past — must be excluded
+        pickup(-1, "Residual"), // past: must be excluded
         pickup(1, "Organic"),
         pickup(3, "Paper"), // later than the 10-day one is irrelevant; earlier wins
         pickup(6, "Recycling"),
@@ -195,14 +195,14 @@ fn dedup_removes_identical_date_label_pairs() {
 #[test]
 fn empty_pickups_produce_empty_state_message() {
     let (plain, html) = render_garbage_list("Next collections", &[], today(), &colors());
-    assert_eq!(plain, "🗑️ No upcoming collections found.");
-    assert_eq!(html, "🗑️ No upcoming collections found.");
+    assert_eq!(plain, "🤷 No upcoming pickups found.");
+    assert_eq!(html, "🤷 No upcoming pickups found.");
 }
 
 #[test]
 fn no_config_at_all_yields_empty_state_via_build_reply() {
     let (plain, _) = build_garbage_reply(GarbageCommand::NextPerType, &[], today(), &colors());
-    assert_eq!(plain, "🗑️ No upcoming collections found.");
+    assert_eq!(plain, "🤷 No upcoming pickups found.");
 }
 
 // ── Compact Matrix output ─────────────────────────────────────────────────
@@ -225,11 +225,11 @@ fn single_bin_reminder_uses_singular_wording_and_only_that_days_pickup() {
 
     assert_eq!(
         plain,
-        "📢 Garbage reminder for tomorrow\nMonday, 10 Aug\n\n⚫ Residual Waste (grey)\n\n@room · Put the bin out tonight · ✅ when done"
+        "🚛 Garbage pickup tomorrow\n📅 Monday, 10 Aug\n\n⚫ Residual Waste (grey)\n\n@room 🌙 Put the bin out tonight.\n👉 Tap ✅ when done."
     );
     assert_eq!(
         html,
-        "📢 <strong>Garbage reminder for tomorrow</strong><br><strong>Monday, 10 Aug</strong><br><br>⚫ Residual Waste (grey)<br><br>@room · Put the bin out tonight · ✅ when done"
+        "🚛 <strong>Garbage pickup tomorrow</strong><br>📅 <strong>Monday, 10 Aug</strong><br><br>⚫ Residual Waste (grey)<br><br>@room 🌙 Put the bin out tonight.<br>👉 Tap ✅ when done."
     );
     assert!(!plain.contains("Paper"));
 }
@@ -256,12 +256,12 @@ fn multi_bin_reminder_lists_each_due_type_with_plural_wording() {
 
     assert_eq!(
         plain,
-        "📢 Garbage reminder for tomorrow\nMonday, 10 Aug\n\n⚫ Residual Waste (grey)\n🟤 Organic Waste (brown)\n🔵 Paper (blue)\n\n@room · Put the bins out tonight · ✅ when done"
+        "🚛 Garbage pickup tomorrow\n📅 Monday, 10 Aug\n\n⚫ Residual Waste (grey)\n🟤 Organic Waste (brown)\n🔵 Paper (blue)\n\n@room 🌙 Put the bins out tonight.\n👉 Tap ✅ when done."
     );
     assert!(
         html.contains("⚫ Residual Waste (grey)<br>🟤 Organic Waste (brown)<br>🔵 Paper (blue)")
     );
-    assert!(html.ends_with("@room · Put the bins out tonight · ✅ when done"));
+    assert!(html.ends_with("@room 🌙 Put the bins out tonight.<br>👉 Tap ✅ when done."));
     assert!(!plain.contains("🗑️"));
 }
 
@@ -317,7 +317,7 @@ fn help_message_is_short_and_lists_all_subcommands() {
 // Regression coverage for a source dropping an imminent pickup from its
 // response a day or two before it happens (observed on the Berlin
 // Recycling portal): a date we've already seen once must keep showing up
-// even if a later fetch no longer lists it — for either source, since a
+// even if a later fetch no longer lists it, for either source, since a
 // failed BSR refresh must not wipe a known-good BSR schedule either.
 
 #[test]
@@ -329,8 +329,8 @@ fn merge_with_empty_cache_returns_fetched_future_dates() {
 
 #[test]
 fn merge_keeps_a_cached_date_the_source_stopped_listing() {
-    // Yesterday's fetch saw tomorrow's pickup; today's fetch — because
-    // the portal already dropped it — no longer includes it.
+    // Yesterday's fetch saw tomorrow's pickup; today's fetch (because
+    // the portal already dropped it) no longer includes it.
     let cache = vec![pickup(1, "Paper"), pickup(8, "Paper")];
     let fetched = vec![pickup(8, "Paper")]; // tomorrow's entry vanished from the source
     let merged = merge_pickup_cache(&cache, &fetched, today());
@@ -619,7 +619,7 @@ fn is_fully_delivered_true_only_when_every_joined_room_has_it() {
 
 #[test]
 fn is_fully_delivered_false_with_no_joined_rooms() {
-    // Not "vacuously delivered" — there must be an actual room that got it.
+    // Not "vacuously delivered". There must be an actual room that got it.
     assert!(!is_fully_delivered(&pending(&[], 0), &[]));
 }
 
@@ -735,7 +735,7 @@ async fn persisted_state_migrates_pre_pending_reminder_fields_format() {
         .expect("pending reminder should load");
     assert_eq!(pending.attempt, 1);
     assert!(pending.sent_room_ids.contains("!a:x"));
-    // created_at is new — defaults to "now" rather than failing to parse
+    // created_at is new: defaults to "now" rather than failing to parse
     // or silently expiring an in-flight reminder on the next tick.
     assert!(
         (reminder_now_utc() - pending.created_at)
@@ -880,9 +880,9 @@ fn confirmed_reminder_replaces_call_to_action_with_who_did_it() {
     let names = posted.confirmed_by().unwrap();
     let (plain, html) = build_reminder(&posted.pickups, date, &reminder_colors(), Some(&names));
 
-    assert!(plain.ends_with("✅ Done — Alice (21:14), Bob <3 (21:30)"));
+    assert!(plain.ends_with("✅ Done by Alice (21:14), Bob <3 (21:30)"));
     assert!(!plain.contains("@room"));
-    assert!(html.ends_with("✅ <strong>Done</strong> — Alice (21:14), Bob &lt;3 (21:30)"));
+    assert!(html.ends_with("✅ <strong>Done</strong> by Alice (21:14), Bob &lt;3 (21:30)"));
 }
 
 #[test]
@@ -913,7 +913,7 @@ fn followup_is_due_once_when_nobody_confirmed() {
 #[test]
 fn no_followup_once_collection_morning_has_started() {
     // A reminder recovered late at 05:00 on collection day would nudge
-    // at 07:00 — after the crews have come.
+    // at 07:00, after the crews have come.
     let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
     let posted = posted_at(berlin(2026, 8, 10, 5, 0), date);
 
@@ -1022,7 +1022,7 @@ fn retracting_the_last_check_withdraws_the_confirmation() {
     assert!(posted.confirmed_by().is_none());
 
     let (plain, _) = build_reminder(&posted.pickups, date, &reminder_colors(), None);
-    assert!(plain.ends_with("✅ when done"));
+    assert!(plain.ends_with("Tap ✅ when done."));
 }
 
 #[test]
@@ -1041,7 +1041,7 @@ fn followup_turns_into_an_all_clear_once_confirmed() {
     );
     let (plain, html) = followup_text(&posted, at);
 
-    assert_eq!(plain, "✅ Bins are out — thanks, Alice <3 (22:05)!");
+    assert_eq!(plain, "✅ Bins are out. Thanks, Alice <3 (22:05)! 🙌");
     assert!(html.contains("Alice &lt;3"));
 }
 
