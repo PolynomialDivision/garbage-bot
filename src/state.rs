@@ -114,6 +114,37 @@ pub(crate) struct PersistedState {
     pub(crate) pending_reminder: Option<PendingReminder>,
     #[serde(default)]
     pub(crate) posted: Option<PostedReminder>,
+    /// The BSR schedule ID looked up from the configured address, so a
+    /// restart does not need the BSR street search again.
+    #[serde(default)]
+    pub(crate) bsr_lookup: Option<BsrLookup>,
+}
+
+/// The address from `[bsr]` that the schedule ID is looked up for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BsrAddress {
+    pub(crate) street: String,
+    pub(crate) number: String,
+    #[serde(default)]
+    pub(crate) plz: Option<String>,
+}
+
+/// A remembered lookup. Kept together with its address so a changed address
+/// in the config is looked up afresh instead of reusing the old ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BsrLookup {
+    pub(crate) address: BsrAddress,
+    pub(crate) schedule_id: String,
+}
+
+impl PersistedState {
+    /// The remembered schedule ID, if it was looked up for `address`.
+    pub(crate) fn remembered_schedule_id(&self, address: &BsrAddress) -> Option<String> {
+        self.bsr_lookup
+            .as_ref()
+            .filter(|lookup| lookup.address == *address)
+            .map(|lookup| lookup.schedule_id.clone())
+    }
 }
 
 pub(crate) async fn load_persisted_state(path: &Path) -> PersistedState {
@@ -162,7 +193,12 @@ pub(crate) struct SourceHealth {
 #[derive(Clone)]
 pub(crate) struct BotState {
     pub(crate) bot: Bot,
-    pub(crate) bsr_schedule_id: String,
+    /// The BSR schedule ID once known: configured, remembered or looked up.
+    /// `None` until a lookup succeeds; every BSR refresh retries it.
+    pub(crate) bsr_schedule_id: Arc<Mutex<Option<String>>>,
+    /// The address to look the schedule ID up for. `None` when `[bsr]` sets
+    /// `schedule_id` directly.
+    pub(crate) bsr_address: Option<BsrAddress>,
     pub(crate) berlin_recycling_creds: Option<(String, String)>,
     pub(crate) waste_labels: HashMap<String, String>,
     pub(crate) waste_colors: HashMap<String, String>,

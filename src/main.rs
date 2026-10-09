@@ -98,30 +98,21 @@ async fn main() -> Result<()> {
     let mut config: Config =
         mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
 
-    // Resolve BSR schedule_id if only street/number given
-    let schedule_id =
-        match config.bsr.schedule_id.take() {
-            Some(id) => id,
-            None => {
-                let street =
-                    config.bsr.street.as_deref().ok_or_else(|| {
-                        anyhow!("Config: set [bsr] schedule_id OR street + number")
-                    })?;
-                let number =
-                    config.bsr.number.as_deref().ok_or_else(|| {
-                        anyhow!("Config: set [bsr] schedule_id OR street + number")
-                    })?;
-                let plz = config.bsr.plz.as_deref();
-                info!(
-                    "Resolving BSR schedule_id for {street} {number}{}...",
-                    plz.map(|p| format!(", PLZ {p}")).unwrap_or_default()
-                );
-                let http = http_client();
-                let id = resolve_schedule_id(&http, street, number, plz).await?;
-                info!("Resolved schedule_id: {id}");
-                id
-            }
-        };
+    // Either a fixed schedule_id, or the address to look it up for. The
+    // lookup itself waits until the state is loaded: a remembered ID makes it
+    // unnecessary, and a BSR outage must not keep the bot from starting.
+    let configured_schedule_id = config.bsr.schedule_id.take();
+    let bsr_address = match configured_schedule_id {
+        Some(_) => None,
+        None => {
+            let missing = || anyhow!("Config: set [bsr] schedule_id OR street + number");
+            Some(BsrAddress {
+                street: config.bsr.street.take().ok_or_else(missing)?,
+                number: config.bsr.number.take().ok_or_else(missing)?,
+                plz: config.bsr.plz.take(),
+            })
+        }
+    };
 
     let store_path = mxbot_common::config::store_path_from_env();
     let settings = Settings::load(
@@ -161,9 +152,17 @@ async fn main() -> Result<()> {
         );
     }
 
+    let schedule_id = configured_schedule_id.or_else(|| {
+        let address = bsr_address.as_ref()?;
+        let id = persisted.remembered_schedule_id(address)?;
+        info!("Using the remembered BSR schedule_id: {id}");
+        Some(id)
+    });
+
     let state = BotState {
         bot: bot.clone(),
-        bsr_schedule_id: schedule_id,
+        bsr_schedule_id: Arc::new(Mutex::new(schedule_id)),
+        bsr_address,
         berlin_recycling_creds,
         waste_labels: config.waste_labels,
         waste_colors: config.waste_colors,
@@ -175,6 +174,16 @@ async fn main() -> Result<()> {
         bsr_health: Arc::new(Mutex::new(SourceHealth::default())),
         br_health: Arc::new(Mutex::new(SourceHealth::default())),
     };
+
+    // Look the schedule ID up now, so the log shows it early. If the BSR is
+    // down, start anyway: reminders use the cached schedule and Berlin
+    // Recycling, and the next refresh tries the lookup again.
+    if let Err(e) = bsr_schedule_id(&state).await {
+        warn!("{e:#}. Starting anyway, the next refresh tries again");
+        let mut health = state.bsr_health.lock().await;
+        health.last_error = Some(format!("{e:#}"));
+        health.consecutive_failures += 1;
+    }
 
     // In-room messages: admin console first, then !garbage commands.
     bot.client.add_event_handler({

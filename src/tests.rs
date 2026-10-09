@@ -700,6 +700,76 @@ async fn persisted_state_round_trips_through_save_and_load() {
     );
 }
 
+fn address(street: &str, number: &str, plz: Option<&str>) -> BsrAddress {
+    BsrAddress {
+        street: street.to_owned(),
+        number: number.to_owned(),
+        plz: plz.map(str::to_owned),
+    }
+}
+
+#[tokio::test]
+async fn remembered_schedule_id_survives_a_restart() {
+    let dir = std::env::temp_dir().join(format!("garbage-bot-test-{}", uuid_ish()));
+    fs::create_dir_all(&dir).await.unwrap();
+    let path = dir.join("reminder_state.json");
+    let home = address("Musterstraße", "1", Some("12345"));
+
+    let original = PersistedState {
+        bsr_lookup: Some(BsrLookup {
+            address: home.clone(),
+            schedule_id: "0490110001".to_owned(),
+        }),
+        ..Default::default()
+    };
+    save_persisted_state(&path, &original).await;
+    let loaded = load_persisted_state(&path).await;
+
+    assert_eq!(
+        loaded.remembered_schedule_id(&home).as_deref(),
+        Some("0490110001")
+    );
+}
+
+#[test]
+fn remembered_schedule_id_is_dropped_when_the_address_changes() {
+    let persisted = PersistedState {
+        bsr_lookup: Some(BsrLookup {
+            address: address("Musterstraße", "1", Some("12345")),
+            schedule_id: "0490110001".to_owned(),
+        }),
+        ..Default::default()
+    };
+
+    for moved in [
+        address("Musterstraße", "2", Some("12345")),
+        address("Beispielweg", "1", Some("12345")),
+        address("Musterstraße", "1", None),
+    ] {
+        assert_eq!(persisted.remembered_schedule_id(&moved), None, "{moved:?}");
+    }
+    let nothing_remembered = PersistedState::default();
+    assert_eq!(
+        nothing_remembered.remembered_schedule_id(&address("Musterstraße", "1", Some("12345"))),
+        None
+    );
+}
+
+#[test]
+fn failed_refresh_records_the_whole_error_chain() {
+    let mut health = SourceHealth::default();
+    let fetched: Result<Vec<Pickup>> = Err(anyhow!(
+        "HTTP status server error (500 Internal Server Error)"
+    )
+    .context("BSR address lookup failed"));
+    apply_fetch_outcome("BSR", &[], fetched, &mut health, today());
+
+    assert_eq!(
+        health.last_error.as_deref(),
+        Some("BSR address lookup failed: HTTP status server error (500 Internal Server Error)")
+    );
+}
+
 #[tokio::test]
 async fn persisted_state_migrates_pre_pending_reminder_fields_format() {
     // Simulates a state file written before `created_at`/`last_expired_date`

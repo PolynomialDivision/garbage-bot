@@ -2,6 +2,9 @@
 
 use super::*;
 
+use anyhow::Context;
+use serde::de::DeserializeOwned;
+
 // ── BSR API ───────────────────────────────────────────────────────────────────
 
 /// Upper bound for any single schedule request. Without it a hanging portal
@@ -50,6 +53,19 @@ pub(crate) struct BsrPickupEntry {
     pub(crate) category: String,
 }
 
+/// GET a BSR endpoint and decode its JSON. The status is checked first, so an
+/// outage is logged as "500 Internal Server Error" instead of a JSON error
+/// about the HTML error page.
+async fn bsr_get_json<T: DeserializeOwned>(http: &reqwest::Client, url: Url) -> Result<T> {
+    Ok(http
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
 pub(crate) async fn resolve_schedule_id(
     http: &reqwest::Client,
     street: &str,
@@ -57,7 +73,7 @@ pub(crate) async fn resolve_schedule_id(
     plz: Option<&str>,
 ) -> Result<String> {
     let url = Url::parse_with_params(BSR_STREETS, &[("searchQuery", street)])?;
-    let streets: Vec<BsrStreetEntry> = http.get(url).send().await?.json().await?;
+    let streets: Vec<BsrStreetEntry> = bsr_get_json(http, url).await?;
 
     if streets.is_empty() {
         return Err(anyhow!("No BSR street found for: {street:?}"));
@@ -71,7 +87,7 @@ pub(crate) async fn resolve_schedule_id(
         BSR_SCHEDID,
         &[("searchQuery", format!("{}:::{}", matched.value, number))],
     )?;
-    let results: Vec<BsrScheduleEntry> = http.get(url).send().await?.json().await?;
+    let results: Vec<BsrScheduleEntry> = bsr_get_json(http, url).await?;
 
     if results.is_empty() {
         return Err(anyhow!(
@@ -104,6 +120,47 @@ pub(crate) async fn resolve_schedule_id(
     Ok(results[0].value.clone())
 }
 
+/// The BSR schedule ID: configured, remembered, or looked up now. A failed
+/// lookup is retried on the next refresh, so a BSR outage does not keep the
+/// bot from starting.
+pub(crate) async fn bsr_schedule_id(state: &BotState) -> Result<String> {
+    if let Some(id) = state.bsr_schedule_id.lock().await.clone() {
+        return Ok(id);
+    }
+    let address = state
+        .bsr_address
+        .as_ref()
+        .ok_or_else(|| anyhow!("No BSR schedule_id or address configured"))?;
+    info!(
+        "Resolving BSR schedule_id for {} {}{}...",
+        address.street,
+        address.number,
+        address
+            .plz
+            .as_deref()
+            .map(|p| format!(", PLZ {p}"))
+            .unwrap_or_default()
+    );
+    let id = resolve_schedule_id(
+        &state.http,
+        &address.street,
+        &address.number,
+        address.plz.as_deref(),
+    )
+    .await
+    .context("BSR address lookup failed")?;
+    info!("Resolved schedule_id: {id}");
+
+    *state.bsr_schedule_id.lock().await = Some(id.clone());
+    let mut persisted = state.persisted.lock().await;
+    persisted.bsr_lookup = Some(BsrLookup {
+        address: address.clone(),
+        schedule_id: id.clone(),
+    });
+    save_persisted_state(&state.reminder_state_path, &persisted).await;
+    Ok(id)
+}
+
 pub(crate) async fn fetch_pickups(
     http: &reqwest::Client,
     schedule_id: &str,
@@ -118,7 +175,7 @@ pub(crate) async fn fetch_pickups(
     );
 
     let url = Url::parse_with_params(BSR_PICKUPS, &[("filter", &filter)])?;
-    let resp: BsrPickupResponse = http.get(url).send().await?.json().await?;
+    let resp: BsrPickupResponse = bsr_get_json(http, url).await?;
 
     let mut pickups: Vec<Pickup> = resp
         .dates
@@ -290,8 +347,8 @@ pub(crate) fn apply_fetch_outcome(
             merge_pickup_cache(cache, &fetched, today)
         }
         Err(e) => {
-            error!("{source_name}: schedule refresh failed, keeping previous schedule: {e}");
-            health.last_error = Some(e.to_string());
+            error!("{source_name}: schedule refresh failed, keeping previous schedule: {e:#}");
+            health.last_error = Some(format!("{e:#}"));
             health.consecutive_failures += 1;
             merge_pickup_cache(cache, &[], today)
         }
@@ -301,7 +358,10 @@ pub(crate) fn apply_fetch_outcome(
 pub(crate) async fn fetch_all_pickups(state: &BotState) -> Vec<Pickup> {
     // Network first, without holding the state lock: a slow portal must not
     // block reactions, status replies or the scheduler meanwhile.
-    let bsr_outcome = fetch_pickups(&state.http, &state.bsr_schedule_id, &state.waste_labels).await;
+    let bsr_outcome = match bsr_schedule_id(state).await {
+        Ok(id) => fetch_pickups(&state.http, &id, &state.waste_labels).await,
+        Err(e) => Err(e),
+    };
     let br_outcome = match state.berlin_recycling_creds {
         Some((ref user, ref pass)) => {
             Some(fetch_berlin_recycling_pickups(user, pass, &state.waste_labels).await)
