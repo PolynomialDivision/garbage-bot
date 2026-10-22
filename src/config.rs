@@ -48,6 +48,21 @@ pub(crate) struct ReminderConfig {
     /// has confirmed with ✅ yet. 0 disables it.
     #[serde(default = "default_followup_minutes")]
     pub(crate) followup_minutes: u32,
+    /// IANA timezone of collection dates and reminder times. Unset: `TZ`,
+    /// else Europe/Berlin (see `reminder_timezone`).
+    #[serde(default, deserialize_with = "timezone_name")]
+    pub(crate) timezone: Option<Tz>,
+}
+
+/// An IANA timezone name; an unknown one is refused at load.
+fn timezone_name<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Tz>, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    name.trim()
+        .parse()
+        .map(Some)
+        .map_err(|_| serde::de::Error::custom(format!("unknown timezone {name:?}")))
 }
 
 pub(crate) fn default_followup_minutes() -> u32 {
@@ -68,6 +83,7 @@ impl Default for ReminderConfig {
             reminder_time: default_reminder_time(),
             max_lateness_minutes: default_max_lateness_minutes(),
             followup_minutes: default_followup_minutes(),
+            timezone: None,
         }
     }
 }

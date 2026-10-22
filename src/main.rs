@@ -31,6 +31,7 @@ use futures_util::FutureExt;
 use mxbot_common::{
     admin::Dispatch,
     config::{MatrixConfig, SecurityConfig, TimeOfDay},
+    format::html_escape as escape_html,
     matrix_sdk::{
         self,
         deserialized_responses::EncryptionInfo,
@@ -46,10 +47,11 @@ use mxbot_common::{
                 room::redaction::OriginalSyncRoomRedactionEvent,
                 Mentions,
             },
-            OwnedEventId, OwnedTransactionId, OwnedUserId,
+            OwnedEventId, OwnedTransactionId, OwnedUserId, TransactionId,
         },
         Room, RoomState,
     },
+    send::{send_with_retry, send_with_retry_txn},
     settings::Settings,
     Bot,
 };
@@ -58,13 +60,36 @@ use tokio::{fs, sync::Mutex, time::sleep};
 use tracing::{error, info, warn};
 use url::Url;
 
-/// Garbage collection dates and reminder wall-clock times are local Berlin
-/// times. Do not use `chrono::Local`: containers frequently retain an UTC
-/// `/etc/localtime` even when a `TZ` environment variable is present.
-const REMINDER_TZ: Tz = chrono_tz::Europe::Berlin;
+/// The timezone without `[reminder] timezone` and `TZ`: the BSR's collection
+/// dates are Berlin's.
+const DEFAULT_REMINDER_TZ: Tz = chrono_tz::Europe::Berlin;
+
+/// The timezone of collection dates and reminder wall-clock times, set once
+/// at startup (see [`reminder_timezone`]). Never `chrono::Local`: containers
+/// frequently retain an UTC `/etc/localtime` even when `TZ` is set.
+static REMINDER_TZ: std::sync::OnceLock<Tz> = std::sync::OnceLock::new();
+
+fn reminder_tz() -> Tz {
+    REMINDER_TZ.get().copied().unwrap_or(DEFAULT_REMINDER_TZ)
+}
+
+/// `[reminder] timezone`, else the `TZ` environment variable (an IANA name,
+/// as compose sets it), else Europe/Berlin. A name that is not a known zone
+/// is an error, never a silent fallback.
+fn reminder_timezone(configured: Option<Tz>, tz_env: Option<&str>) -> Result<Tz> {
+    if let Some(tz) = configured {
+        return Ok(tz);
+    }
+    match tz_env.map(|v| v.trim().trim_start_matches(':')) {
+        None | Some("") => Ok(DEFAULT_REMINDER_TZ),
+        Some(name) => name.parse().map_err(|_| {
+            anyhow!("TZ={name:?} is not an IANA timezone; set [reminder] timezone instead")
+        }),
+    }
+}
 
 fn reminder_now() -> DateTime<Tz> {
-    chrono::Utc::now().with_timezone(&REMINDER_TZ)
+    chrono::Utc::now().with_timezone(&reminder_tz())
 }
 
 fn reminder_now_utc() -> DateTime<chrono::Utc> {
@@ -114,6 +139,15 @@ async fn main() -> Result<()> {
         }
     };
 
+    let tz = reminder_timezone(
+        config.reminder.timezone,
+        std::env::var("TZ").ok().as_deref(),
+    )?;
+    REMINDER_TZ
+        .set(tz)
+        .expect("the reminder timezone is set once");
+    info!("Reminder timezone: {tz}");
+
     let store_path = mxbot_common::config::store_path_from_env();
     let settings = Settings::load(
         store_path.join("settings.json"),
@@ -128,11 +162,11 @@ async fn main() -> Result<()> {
     let bot = Bot::builder("garbage-bot", env!("CARGO_PKG_VERSION"))
         .store_path(&store_path)
         .settings(settings.store().clone())
-        .admin_help(
+        .admin_help(format!(
             "!garbage status · !garbage refresh\n\
-             Settings: reminder_time (HH:MM, Europe/Berlin), max_lateness_minutes,\n\
-             followup_minutes (nudge when nobody confirmed; 0 = off)",
-        )
+             Settings: reminder_time (HH:MM, {tz}), max_lateness_minutes,\n\
+             followup_minutes (nudge when nobody confirmed; 0 = off)"
+        ))
         .start(&config.matrix, &config.security)
         .await?;
 

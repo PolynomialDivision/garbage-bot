@@ -80,7 +80,7 @@ impl PostedReminder {
                     format!(
                         "{} ({})",
                         c.name,
-                        c.at.with_timezone(&REMINDER_TZ).format("%H:%M")
+                        c.at.with_timezone(&reminder_tz()).format("%H:%M")
                     )
                 })
                 .collect::<Vec<_>>()

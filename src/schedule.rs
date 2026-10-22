@@ -147,18 +147,15 @@ pub(crate) async fn deliver_reminder_to_room(
     let mut mentions = Mentions::new();
     mentions.room = true;
     content = content.add_mentions(mentions);
-    let resp = match transaction_id {
-        Some(transaction_id) => {
-            room.send(content)
-                .with_transaction_id(transaction_id)
-                .await?
-        }
-        None => room.send(content).await?,
-    };
-    let event_id = resp.response.event_id;
+    // A fixed transaction ID (the persisted reminder's) makes a retry after a
+    // restart return the posted event instead of a second reminder, and its
+    // seed reaction likewise.
+    let transaction_id = transaction_id.unwrap_or_else(TransactionId::new);
+    let event_id = send_with_retry_txn(room, content, &transaction_id).await?;
 
     let reaction = ReactionEventContent::new(Annotation::new(event_id.clone(), "✅".to_owned()));
-    if let Err(e) = room.send(reaction).await {
+    let seed_id: OwnedTransactionId = format!("{transaction_id}-seed").into();
+    if let Err(e) = send_with_retry_txn(room, reaction, &seed_id).await {
         warn!(
             "Failed to seed confirmation reaction in {}: {e}",
             room.room_id()
@@ -306,7 +303,7 @@ pub(crate) async fn maybe_start_reminder(state: &BotState, target_time: NaiveTim
     );
     info!(
         now = %now.to_rfc3339(),
-        timezone = %REMINDER_TZ,
+        timezone = %reminder_tz(),
         reminder_time = %target_time.format("%H:%M"),
         last_checked = ?last_checked_date,
         last_sent = ?last_sent_date,
@@ -346,7 +343,7 @@ pub(crate) async fn run_scheduler(state: BotState) {
     let now = reminder_now();
     let next = next_reminder_datetime(now, target_time);
     info!(
-        timezone = %REMINDER_TZ,
+        timezone = %reminder_tz(),
         reminder_time = %target_time.format("%H:%M"),
         now = %now.to_rfc3339(),
         next = %next.to_rfc3339(),

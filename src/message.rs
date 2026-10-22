@@ -7,12 +7,10 @@ use super::*;
 /// Map a `#RRGGBB` hex color to the closest colored-circle emoji.
 pub(crate) fn hex_to_dot(hex: &str) -> &'static str {
     let s = hex.trim_start_matches('#');
-    let Ok(n) = u32::from_str_radix(&s[..s.len().min(6)], 16) else {
+    // `get`, not slicing: a non-ASCII colour from the config must not panic.
+    let Some(Ok(n)) = s.get(..6).map(|rgb| u32::from_str_radix(rgb, 16)) else {
         return "🗑️";
     };
-    if s.len() < 6 {
-        return "🗑️";
-    }
     let r = ((n >> 16) & 0xff) as f32;
     let g = ((n >> 8) & 0xff) as f32;
     let b = (n & 0xff) as f32;

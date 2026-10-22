@@ -11,6 +11,77 @@ fn reminder_clock_is_explicitly_berlin_not_container_localtime() {
     assert_eq!(reminder_now().timezone(), chrono_tz::Europe::Berlin);
 }
 
+#[test]
+fn reminder_timezone_from_config_then_tz_then_berlin() {
+    use chrono_tz::{America::New_York, Europe::Berlin, Europe::Vienna};
+    assert_eq!(
+        reminder_timezone(Some(Vienna), Some("UTC")).unwrap(),
+        Vienna
+    );
+    assert_eq!(
+        reminder_timezone(None, Some("America/New_York")).unwrap(),
+        New_York
+    );
+    assert_eq!(
+        reminder_timezone(None, Some(":Europe/Vienna")).unwrap(),
+        Vienna
+    );
+    assert_eq!(reminder_timezone(None, Some("")).unwrap(), Berlin);
+    assert_eq!(reminder_timezone(None, None).unwrap(), Berlin);
+    // A TZ chrono-tz does not know is an error, not a silent Berlin.
+    assert!(reminder_timezone(None, Some("CET-1CEST")).is_err());
+}
+
+/// house-infra's rendered config (build/rendered/…/garbage-bot.config.toml,
+/// credentials, address and IDs replaced).
+const HOUSE_INFRA_CONFIG: &str = include_str!("../tests/fixtures/house-infra.config.toml");
+
+#[test]
+fn house_infra_and_example_configs_load() {
+    let config: Config = toml::from_str(HOUSE_INFRA_CONFIG).unwrap();
+    assert_eq!(config.reminder.reminder_time, TimeOfDay::new(18, 0));
+    assert!(config.reminder.timezone.is_none());
+    assert_eq!(config.bsr.number.as_deref(), Some("1"));
+    assert!(config.berlin_recycling.is_some());
+    assert_eq!(config.waste_colors.len(), 6);
+
+    let example: Config = toml::from_str(include_str!("../config.toml.example")).unwrap();
+    assert!(example.reminder.timezone.is_none());
+}
+
+#[test]
+fn reminder_timezone_key_is_checked_at_load() {
+    let with = |tz: &str| {
+        toml::from_str::<Config>(&HOUSE_INFRA_CONFIG.replace(
+            "reminder_time = \"18:00\"",
+            &format!("reminder_time = \"18:00\"\ntimezone = \"{tz}\""),
+        ))
+    };
+    assert_eq!(
+        with("Europe/Vienna").unwrap().reminder.timezone,
+        Some(chrono_tz::Europe::Vienna)
+    );
+    assert!(with("Europe/Viena").is_err());
+}
+
+#[test]
+fn colour_dots_never_panic_on_odd_config_values() {
+    assert_eq!(hex_to_dot("#4682B4"), "🔵");
+    assert_eq!(hex_to_dot("#808080"), "⚫");
+    assert_eq!(hex_to_dot("#12345ä"), "🗑️");
+    assert_eq!(hex_to_dot("ääää"), "🗑️");
+    assert_eq!(hex_to_dot("#fff"), "🗑️");
+    assert_eq!(hex_to_dot(""), "🗑️");
+}
+
+#[test]
+fn html_is_escaped_in_labels() {
+    assert_eq!(
+        escape_html("<b>O'Neil & Co</b>"),
+        "&lt;b&gt;O&#39;Neil &amp; Co&lt;/b&gt;"
+    );
+}
+
 fn colors() -> HashMap<String, String> {
     HashMap::from([
         ("Organic".to_owned(), "#8B4513".to_owned()),
@@ -915,7 +986,7 @@ fn posted_at(sent_at: DateTime<chrono::Utc>, date: NaiveDate) -> PostedReminder 
 }
 
 fn berlin(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<chrono::Utc> {
-    REMINDER_TZ
+    DEFAULT_REMINDER_TZ
         .with_ymd_and_hms(y, m, d, h, min, 0)
         .unwrap()
         .to_utc()
@@ -997,8 +1068,8 @@ fn no_followup_once_collection_morning_has_started() {
 fn followup_says_this_morning_after_midnight() {
     let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
     let posted = posted_at(berlin(2026, 8, 9, 23, 0), date);
-    let evening = berlin(2026, 8, 9, 23, 30).with_timezone(&REMINDER_TZ);
-    let night = berlin(2026, 8, 10, 1, 0).with_timezone(&REMINDER_TZ);
+    let evening = berlin(2026, 8, 9, 23, 30).with_timezone(&DEFAULT_REMINDER_TZ);
+    let night = berlin(2026, 8, 10, 1, 0).with_timezone(&DEFAULT_REMINDER_TZ);
 
     assert!(followup_text(&posted, evening)
         .0
@@ -1099,7 +1170,7 @@ fn retracting_the_last_check_withdraws_the_confirmation() {
 fn followup_turns_into_an_all_clear_once_confirmed() {
     let date = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
     let mut posted = posted_at(berlin(2026, 8, 9, 20, 0), date);
-    let at = berlin(2026, 8, 9, 22, 0).with_timezone(&REMINDER_TZ);
+    let at = berlin(2026, 8, 9, 22, 0).with_timezone(&DEFAULT_REMINDER_TZ);
     assert!(followup_text(&posted, at).0.starts_with("⏰ @room Nobody"));
 
     add_confirmation(

@@ -121,13 +121,6 @@ pub(crate) fn format_relative_date(date: NaiveDate, today: NaiveDate) -> String 
     }
 }
 
-pub(crate) fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 pub(crate) fn garbage_empty_message() -> (String, String) {
     let text = "🤷 No upcoming pickups found.".to_owned();
     (text.clone(), text)
@@ -311,10 +304,7 @@ pub(crate) async fn handle_garbage_command(
         }
     };
 
-    if let Err(e) = room
-        .send(RoomMessageEventContent::text_html(plain, html))
-        .await
-    {
+    if let Err(e) = send_with_retry(&room, RoomMessageEventContent::text_html(plain, html)).await {
         error!("Failed to send !garbage reply: {e}");
     }
 }

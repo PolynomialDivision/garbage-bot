@@ -1023,6 +1023,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
  "url",
 ]
@@ -2152,7 +2153,7 @@ dependencies = [
 [[package]]
 name = "mxbot-common"
 version = "0.2.0"
-source = "git+https://github.com/PolynomialDivision/mxbot-common#022ad878fcf3961904470a3dd1c87557882ce239"
+source = "git+https://github.com/PolynomialDivision/mxbot-common#c386a67154d303493f93c65190b29e87455ca4c8"
 dependencies = [
  "anyhow",
  "futures-util",

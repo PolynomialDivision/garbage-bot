@@ -165,7 +165,7 @@ pub(crate) async fn edit_reminder_messages(state: &BotState) {
                 event_id,
                 Some(Mentions::with_room_mention()),
             ));
-        if let Err(e) = room.send(content).await {
+        if let Err(e) = send_with_retry(&room, content).await {
             error!("Failed to update reminder in {}: {e}", room.room_id());
         }
     }
@@ -174,7 +174,7 @@ pub(crate) async fn edit_reminder_messages(state: &BotState) {
     let Some(followup_at) = posted.followup_at else {
         return;
     };
-    let (plain, html) = followup_text(&posted, followup_at.with_timezone(&REMINDER_TZ));
+    let (plain, html) = followup_text(&posted, followup_at.with_timezone(&reminder_tz()));
     for room in state.bot.broadcast_rooms() {
         let Some(event_id) = posted
             .followup_event_ids
@@ -189,7 +189,7 @@ pub(crate) async fn edit_reminder_messages(state: &BotState) {
                 event_id,
                 Some(Mentions::with_room_mention()),
             ));
-        if let Err(e) = room.send(content).await {
+        if let Err(e) = send_with_retry(&room, content).await {
             error!("Failed to update follow-up in {}: {e}", room.room_id());
         }
     }
@@ -212,7 +212,7 @@ pub(crate) fn followup_due_at(
     }
     let due = posted.sent_at + followup_after;
     let deadline = resolve_local(
-        &REMINDER_TZ,
+        &reminder_tz(),
         posted
             .date
             .and_hms_opt(LAST_FOLLOWUP_HOUR, 0, 0)
@@ -283,15 +283,14 @@ pub(crate) async fn maybe_send_followup(state: &BotState) {
         content.relates_to = Some(Relation::Reply(Reply::with_event_id(event_id)));
         let transaction_id: OwnedTransactionId =
             format!("garbage-followup-{}-{}", posted.date, room.room_id()).into();
-        match room.send(content).with_transaction_id(transaction_id).await {
-            Ok(resp) => {
+        match send_with_retry_txn(&room, content, &transaction_id).await {
+            Ok(followup_id) => {
                 info!("Follow-up sent to {} for {}", room.room_id(), posted.date);
                 let mut persisted = state.persisted.lock().await;
                 if let Some(current) = persisted.posted.as_mut().filter(|p| p.date == posted.date) {
-                    current.followup_event_ids.insert(
-                        room.room_id().to_string(),
-                        resp.response.event_id.to_string(),
-                    );
+                    current
+                        .followup_event_ids
+                        .insert(room.room_id().to_string(), followup_id.to_string());
                     save_persisted_state(&state.reminder_state_path, &persisted).await;
                 }
             }

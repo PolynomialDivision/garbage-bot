@@ -46,6 +46,9 @@ reminder_time = "20:00"
 # posts one follow-up as a reply to it (default: 120; 0 = never). No follow-up
 # is sent after 06:00 on collection day.
 # followup_minutes = 120
+# IANA timezone of the collection dates and the reminder time (default: the
+# TZ environment variable if set, else Europe/Berlin).
+# timezone = "Europe/Berlin"
 
 [security]
 # Users allowed to run admin commands, privately in a

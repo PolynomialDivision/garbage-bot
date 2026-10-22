@@ -1,0 +1,56 @@
+# Rendered by Ansible from stacks/matrix-bots/secrets/garbage-bot.config.toml.j2. Do not edit on the host.
+[matrix]
+homeserver = "http://tuwunel:8008"
+user_id = "@garbage-bot:example.org"
+device_id = "HOUSEINFRAGARBAGEBOT"
+# access_token: MATRIX_ACCESS_TOKEN from session/matrix.env (roles/matrix_accounts).
+
+[security]
+admin_users = ["@nick:example.org", "@admin2:example.org"]
+allowed_inviters = ["@nick:example.org", "@admin2:example.org"]
+allowed_rooms = ["!room:example.org"]
+dm_rooms = ["!room:example.org"]
+encryption_strategy = "identity_based"
+# verified: a person's identity as verified with the bot (!admin verify); a new identity stops
+# everything until they verify again. cross_signed: every device they signed with their
+# current identity; a new identity is accepted and logged (mxbot-common, 2026-10-19).
+trust = "cross_signed"
+
+[security.verification]
+allowed_users = []
+allow_users_from_joined_rooms = true
+
+[security.admin_dm]
+enabled = true
+require_encryption = true
+require_verified_device = false
+# Also the bot's broadcast posts (digests, reminders) into the admins' private chats.
+receive_broadcasts = false
+
+[bsr]
+street = "Musterstr."   # house_address (matrix.yml)
+number = "1"
+plz = "10115"
+
+[berlin_recycling]
+username = "user@example.org"
+password = "fake-password"
+
+[reminder]
+reminder_time = "18:00"
+
+[waste_labels]
+HM = "Residual Waste (grey)"
+BI = "Organic Waste (brown)"
+WS = "Recyclables (yellow)"
+LT = "Garden Waste (green)"
+WB = "Christmas Tree"
+"Altpapier, gemischt" = "Paper (blue)"
+
+[waste_colors]
+"Residual Waste (grey)" = "#808080"
+"Organic Waste (brown)" = "#8B4513"
+"Recyclables (yellow)" = "#DAA520"
+"Garden Waste (green)" = "#556B2F"
+"Christmas Tree" = "#006400"
+"Paper (blue)" = "#4682B4"
