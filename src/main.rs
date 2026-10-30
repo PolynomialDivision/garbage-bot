@@ -53,6 +53,7 @@ use mxbot_common::{
     },
     send::{send_with_retry, send_with_retry_txn},
     settings::Settings,
+    supervise::{supervise_ticking, Alive},
     Bot,
 };
 use serde::{Deserialize, Serialize};
@@ -96,8 +97,9 @@ fn reminder_now_utc() -> DateTime<chrono::Utc> {
     reminder_now().to_utc()
 }
 
-/// Matrix handlers run independently from the sync loop. Do not let a panic
-/// in one disappear silently while the process otherwise stays healthy.
+/// Matrix handlers run independently from the sync loop. Release builds abort
+/// on a panic (Cargo.toml): the bot ends and Docker restarts it. Where panics
+/// unwind (tests, debug builds), one is logged here instead of disappearing.
 fn spawn_logged<F>(name: &'static str, future: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -279,19 +281,25 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Scheduler
-    spawn_logged("reminder-scheduler", {
-        let state = state.clone();
-        async move {
-            if test_mode {
+    // Scheduler. Supervised: if it ends, the bot exits and Docker restarts
+    // it; a round that hangs makes the container unhealthy. Pauses are at
+    // most 15 minutes, so an hour is three of them plus their rounds.
+    if test_mode {
+        spawn_logged("test-reminder", {
+            let state = state.clone();
+            async move {
                 info!("Test mode: sending next upcoming reminder immediately");
                 send_test_reminder(&state).await;
                 info!("Test reminder sent. Waiting for reactions (Ctrl+C to quit)...");
-            } else {
-                run_scheduler(state).await;
             }
-        }
-    });
+        });
+    } else {
+        supervise_ticking(
+            "reminder scheduler",
+            Duration::from_secs(60 * 60),
+            |alive| run_scheduler(state.clone(), alive),
+        );
+    }
 
     info!("Starting Matrix sync...");
     bot.initial_sync().await;

@@ -338,7 +338,8 @@ pub(crate) async fn maybe_start_reminder(state: &BotState, target_time: NaiveTim
     save_persisted_state(&state.reminder_state_path, &persisted).await;
 }
 
-pub(crate) async fn run_scheduler(state: BotState) {
+/// `alive` ticks at the start of every round (sleeps are at most 15 minutes).
+pub(crate) async fn run_scheduler(state: BotState, alive: Alive) {
     let target_time = state.reminder_time();
     let now = reminder_now();
     let next = next_reminder_datetime(now, target_time);
@@ -350,6 +351,7 @@ pub(crate) async fn run_scheduler(state: BotState) {
         "Reminder scheduler started"
     );
     loop {
+        alive.tick();
         // Order matters: create today's pending reminder first (if due), then
         // attempt delivery in the same tick. A freshly-created reminder
         // doesn't wait for the next tick just to make its first send attempt.
