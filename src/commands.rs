@@ -22,21 +22,38 @@ pub(crate) enum GarbageCommand {
     Help,
 }
 
+/// The `!garbage` verbs, in the order of the help. A reply's quoted fallback
+/// makes a message no command, as before the table.
+const COMMANDS: Commands = Commands::family(
+    "garbage",
+    &[
+        Spec::new("", "📋", "next per type"),
+        Spec::new("next", "⏭️", "next pickup"),
+        Spec::new("week", "📆", "next 7 days"),
+        Spec::new("status", "🩺", "source health"),
+        Spec::new("refresh", "🔄", "reload (admin)").admin(),
+        Spec::new("version", "🏷️", "build version"),
+        Spec::new("help", "", "this help").hidden(),
+    ],
+)
+.raw_body();
+
+/// Admins are checked when `refresh` runs, in [`handle_garbage_command`].
 pub(crate) fn parse_garbage_command(body: &str) -> Option<GarbageCommand> {
-    let lower = body.trim().to_ascii_lowercase();
-    if lower == "!garbage" {
-        return Some(GarbageCommand::NextPerType);
+    match COMMANDS.parse(body) {
+        Parsed::NotOurs => None,
+        Parsed::Run(invocation) if invocation.rest.is_empty() => Some(match invocation.spec.name {
+            "" => GarbageCommand::NextPerType,
+            "next" => GarbageCommand::NextEvent,
+            "week" => GarbageCommand::Week,
+            "status" => GarbageCommand::Status,
+            "refresh" => GarbageCommand::Refresh,
+            "version" => GarbageCommand::Version,
+            _ => GarbageCommand::Help,
+        }),
+        // An unknown verb, or words after a known one.
+        _ => Some(GarbageCommand::Help),
     }
-    let rest = lower.strip_prefix("!garbage ")?.trim();
-    Some(match rest {
-        "" => GarbageCommand::NextPerType,
-        "next" => GarbageCommand::NextEvent,
-        "week" => GarbageCommand::Week,
-        "status" => GarbageCommand::Status,
-        "refresh" => GarbageCommand::Refresh,
-        "version" => GarbageCommand::Version,
-        _ => GarbageCommand::Help,
-    })
 }
 
 /// Remove duplicate (date, label) pairs. The BSR and Berlin Recycling feeds
@@ -122,26 +139,19 @@ pub(crate) fn format_relative_date(date: NaiveDate, today: NaiveDate) -> String 
 }
 
 pub(crate) fn garbage_empty_message() -> (String, String) {
-    let text = "🤷 No upcoming pickups found.".to_owned();
-    (text.clone(), text)
+    reply::plain_and_html("🤷 No upcoming pickups found.")
 }
 
 pub(crate) fn garbage_help_message() -> (String, String) {
-    let plain = "🗑️ Garbage commands\n\
-                 📋 !garbage: next per type\n\
-                 ⏭️ !garbage next: next pickup\n\
-                 📆 !garbage week: next 7 days\n\
-                 🩺 !garbage status: source health\n\
-                 🔄 !garbage refresh: reload (admin)\n\
-                 🏷️ !garbage version: build version"
-        .to_owned();
-    let html = plain.replace('\n', "<br>");
-    (plain, html)
+    reply::plain_and_html(COMMANDS.help("🗑️ Garbage commands"))
+}
+
+pub(crate) fn garbage_not_admin_message() -> (String, String) {
+    reply::plain_and_html(reply::NOT_ADMIN)
 }
 
 pub(crate) fn garbage_version_message() -> (String, String) {
-    let text = format!("🗑️ garbage-bot v{}", env!("CARGO_PKG_VERSION"));
-    (text.clone(), text)
+    reply::plain_and_html(format!("🗑️ garbage-bot v{}", env!("CARGO_PKG_VERSION")))
 }
 
 /// One-line human summary of a source's health for `!garbage status`.
@@ -210,9 +220,7 @@ pub(crate) async fn build_status_message(state: &BotState) -> (String, String) {
         describe_reminder_state(&persisted)
     ));
 
-    let plain = lines.join("\n");
-    let html = escape_html(&plain).replace('\n', "<br>");
-    (plain, html)
+    reply::plain_and_html(lines.join("\n"))
 }
 
 /// Render a compact one-line-per-pickup list, optimized for small phone
@@ -289,8 +297,7 @@ pub(crate) async fn handle_garbage_command(
         GarbageCommand::Status => build_status_message(&state).await,
         GarbageCommand::Refresh => {
             if !state.bot.is_admin(&sender) {
-                let msg = "⛔ Only admins can do that.".to_owned();
-                (msg.clone(), msg)
+                garbage_not_admin_message()
             } else {
                 info!("!garbage refresh requested by {sender}");
                 fetch_all_pickups(&state).await;

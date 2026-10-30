@@ -106,10 +106,9 @@ pub(crate) fn build_reminder(
     (plain, html)
 }
 
-pub(crate) fn strip_variation_selectors(s: &str) -> String {
-    s.chars()
-        .filter(|&c| !('\u{FE00}'..='\u{FE0F}').contains(&c))
-        .collect()
-}
-
 pub(crate) const DONE_REACTIONS: &[&str] = &["✅", "✔", "☑"];
+
+/// Whether a reaction key confirms the reminder.
+pub(crate) fn is_done_reaction(key: &str) -> bool {
+    reaction::is_one_of(key, DONE_REACTIONS)
+}

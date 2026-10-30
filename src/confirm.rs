@@ -9,8 +9,7 @@ pub(crate) async fn handle_reaction(state: BotState, room: Room, ev: OriginalSyn
     if ev.sender == state.bot.user_id {
         return;
     }
-    let key = strip_variation_selectors(&ev.content.relates_to.key);
-    if !DONE_REACTIONS.contains(&key.as_str()) {
+    if !is_done_reaction(&ev.content.relates_to.key) {
         return;
     }
     let related_id = ev.content.relates_to.event_id.to_string();

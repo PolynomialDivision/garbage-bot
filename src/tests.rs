@@ -160,6 +160,118 @@ fn ignores_unrelated_messages() {
     assert_eq!(parse_garbage_command("!reset-trust @x:y"), None);
 }
 
+// Pinned before the move to mxbot_common::command: what residents get must
+// not change with it.
+#[test]
+fn command_corpus_is_pinned() {
+    use GarbageCommand::*;
+    let corpus: &[(&str, Option<GarbageCommand>)] = &[
+        ("!garbage", Some(NextPerType)),
+        ("!Garbage", Some(NextPerType)),
+        ("!GARBAGE", Some(NextPerType)),
+        ("\n !garbage \n", Some(NextPerType)),
+        ("!garbage next", Some(NextEvent)),
+        ("!garbage   next  ", Some(NextEvent)),
+        ("!Garbage Next", Some(NextEvent)),
+        ("!garbage week", Some(Week)),
+        ("!garbage WEEK", Some(Week)),
+        ("!garbage status", Some(Status)),
+        ("!garbage refresh", Some(Refresh)),
+        ("!garbage Refresh", Some(Refresh)),
+        ("!garbage version", Some(Version)),
+        ("!garbage help", Some(Help)),
+        ("!garbage HELP", Some(Help)),
+        ("!garbage ?", Some(Help)),
+        ("!garbage next week", Some(Help)),
+        ("!garbage refresh now", Some(Help)),
+        ("!garbage next-per-type", Some(Help)),
+        ("!garbage nxt", Some(Help)),
+        ("!garbage 🗑️", Some(Help)),
+        ("", None),
+        ("garbage", None),
+        ("garbage next", None),
+        ("!garbag", None),
+        ("!garbages next", None),
+        ("!garbage-next", None),
+        ("x !garbage", None),
+        ("!next", None),
+        ("!help", None),
+        ("!admin", None),
+        ("> <@a:x> !garbage\n\n!garbage", None),
+    ];
+    for (body, expected) in corpus {
+        assert_eq!(parse_garbage_command(body), *expected, "{body:?}");
+    }
+}
+
+// The one change from the shared table: any whitespace separates the verb.
+// A tab or line break after `!garbage` used to make the message no command.
+#[test]
+fn any_whitespace_separates_the_verb() {
+    assert_eq!(
+        parse_garbage_command("!garbage\tnext"),
+        Some(GarbageCommand::NextEvent)
+    );
+    assert_eq!(
+        parse_garbage_command("!garbage\nweek"),
+        Some(GarbageCommand::Week)
+    );
+}
+
+#[test]
+fn help_and_short_replies_are_pinned() {
+    let (plain, html) = garbage_help_message();
+    assert_eq!(
+        plain,
+        "🗑️ Garbage commands\n\
+         📋 !garbage: next per type\n\
+         ⏭️ !garbage next: next pickup\n\
+         📆 !garbage week: next 7 days\n\
+         🩺 !garbage status: source health\n\
+         🔄 !garbage refresh: reload (admin)\n\
+         🏷️ !garbage version: build version"
+    );
+    assert_eq!(
+        html,
+        "🗑️ Garbage commands<br>\
+         📋 !garbage: next per type<br>\
+         ⏭️ !garbage next: next pickup<br>\
+         📆 !garbage week: next 7 days<br>\
+         🩺 !garbage status: source health<br>\
+         🔄 !garbage refresh: reload (admin)<br>\
+         🏷️ !garbage version: build version"
+    );
+    assert_eq!(
+        build_garbage_reply(GarbageCommand::Help, &[], today(), &colors()),
+        (plain, html)
+    );
+    let refused = "⛔ Only admins can do that.".to_owned();
+    assert_eq!(garbage_not_admin_message(), (refused.clone(), refused));
+    let version = format!("🗑️ garbage-bot v{}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(garbage_version_message(), (version.clone(), version));
+    let empty = "🤷 No upcoming pickups found.".to_owned();
+    assert_eq!(garbage_empty_message(), (empty.clone(), empty));
+}
+
+#[test]
+fn done_reactions_are_pinned() {
+    for key in [
+        "✅",
+        "✅\u{fe0f}",
+        "✔",
+        "✔\u{fe0f}",
+        "☑",
+        "☑\u{fe0f}",
+        "✔\u{fe0e}",
+        "\u{fe0f}✅",
+    ] {
+        assert!(is_done_reaction(key), "{key:?}");
+    }
+    for key in ["", "👍", "✅✅", "✅🏽", "✖", "❌", "✓", "done"] {
+        assert!(!is_done_reaction(key), "{key:?}");
+    }
+}
+
 // ── Relative date formatting ──────────────────────────────────────────────
 
 #[test]

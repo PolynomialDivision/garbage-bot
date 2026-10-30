@@ -30,6 +30,7 @@ use chrono_tz::Tz;
 use futures_util::FutureExt;
 use mxbot_common::{
     admin::Dispatch,
+    command::{Commands, Parsed, Spec},
     config::{MatrixConfig, SecurityConfig, TimeOfDay},
     format::html_escape as escape_html,
     matrix_sdk::{
@@ -37,8 +38,7 @@ use mxbot_common::{
         deserialized_responses::EncryptionInfo,
         ruma::{
             events::{
-                reaction::{OriginalSyncReactionEvent, ReactionEventContent},
-                relation::Annotation,
+                reaction::OriginalSyncReactionEvent,
                 relation::Reply,
                 room::message::{
                     MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
@@ -51,6 +51,7 @@ use mxbot_common::{
         },
         Room, RoomState,
     },
+    reaction, reply,
     send::{send_with_retry, send_with_retry_txn},
     settings::Settings,
     supervise::{supervise_ticking, Alive},

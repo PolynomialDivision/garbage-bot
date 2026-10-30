@@ -153,14 +153,8 @@ pub(crate) async fn deliver_reminder_to_room(
     let transaction_id = transaction_id.unwrap_or_else(TransactionId::new);
     let event_id = send_with_retry_txn(room, content, &transaction_id).await?;
 
-    let reaction = ReactionEventContent::new(Annotation::new(event_id.clone(), "✅".to_owned()));
-    let seed_id: OwnedTransactionId = format!("{transaction_id}-seed").into();
-    if let Err(e) = send_with_retry_txn(room, reaction, &seed_id).await {
-        warn!(
-            "Failed to seed confirmation reaction in {}: {e}",
-            room.room_id()
-        );
-    }
+    let seed_id = format!("{transaction_id}-seed");
+    reaction::add_buttons(room, &event_id, &["✅"], Some(&seed_id)).await;
     Ok(event_id)
 }
 
