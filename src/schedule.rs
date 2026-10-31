@@ -163,10 +163,10 @@ pub(crate) async fn deliver_reminder_to_room(
 /// retries (and restart recovery, since `pending_reminder` is loaded straight
 /// from disk) never duplicate a send. Only marks the reminder as sent once
 /// every currently-joined room has it.
-pub(crate) async fn resolve_pending_reminder(state: &BotState) {
+pub(crate) async fn resolve_pending_reminder(state: &BotState) -> Resolved {
     let pending = { state.persisted.lock().await.pending_reminder.clone() };
     let Some(mut pending) = pending else {
-        return;
+        return Resolved::NothingPending;
     };
 
     let now = reminder_now();
@@ -183,7 +183,7 @@ pub(crate) async fn resolve_pending_reminder(state: &BotState) {
         persisted.pending_reminder = None;
         persisted.last_expired_date = Some(pending.date);
         save_persisted_state(&state.reminder_state_path, &persisted).await;
-        return;
+        return Resolved::Expired(pending.date);
     }
 
     let rooms = state.bot.broadcast_rooms();
@@ -229,11 +229,13 @@ pub(crate) async fn resolve_pending_reminder(state: &BotState) {
     }
 
     let mut persisted = state.persisted.lock().await;
-    if is_fully_delivered(&pending, &joined_ids) {
+    let resolved = if is_fully_delivered(&pending, &joined_ids) {
         info!("Reminder for {} fully delivered", pending.date);
         persisted.last_sent_date = Some(pending.date);
         persisted.pending_reminder = None;
+        Resolved::Delivered
     } else {
+        let date = pending.date;
         pending.attempt += 1;
         let delay = backoff_delay(pending.attempt);
         warn!(
@@ -243,8 +245,37 @@ pub(crate) async fn resolve_pending_reminder(state: &BotState) {
             pending.attempt
         );
         persisted.pending_reminder = Some(pending);
-    }
+        Resolved::NotYet(date)
+    };
     save_persisted_state(&state.reminder_state_path, &persisted).await;
+    resolved
+}
+
+/// What [`resolve_pending_reminder`] did, for the status file (the scheduler does not
+/// depend on it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Resolved {
+    /// No reminder waiting: nothing to do this round.
+    NothingPending,
+    /// The reminder reached every room.
+    Delivered,
+    /// Some rooms still miss the reminder for this date; retried.
+    NotYet(NaiveDate),
+    /// The reminder for this date was dropped unsent (too late to be useful).
+    Expired(NaiveDate),
+}
+
+impl Resolved {
+    pub(crate) fn report(self, alive: &Alive) {
+        match self {
+            Resolved::NothingPending => alive.idle(),
+            Resolved::Delivered => alive.ok(),
+            Resolved::NotYet(date) => {
+                alive.failed(format!("reminder for {date} not delivered everywhere yet"))
+            }
+            Resolved::Expired(date) => alive.gave_up(format!("reminder for {date} expired unsent")),
+        }
+    }
 }
 
 /// Remember where the reminder for `date` was posted, so ✅ reactions on it
@@ -344,6 +375,9 @@ pub(crate) async fn run_scheduler(state: BotState, alive: Alive) {
         next = %next.to_rfc3339(),
         "Reminder scheduler started"
     );
+    // Rounds are at most 15 minutes apart, and every round that finds nothing to deliver is
+    // a healthy one: an hour without one means the reminders are stuck.
+    alive.expect_every(Duration::from_secs(60 * 60));
     loop {
         alive.tick();
         // Order matters: create today's pending reminder first (if due), then
@@ -352,13 +386,19 @@ pub(crate) async fn run_scheduler(state: BotState, alive: Alive) {
         // Re-read each tick: admins can change the time at runtime.
         let target_time = state.reminder_time();
         maybe_start_reminder(&state, target_time).await;
-        resolve_pending_reminder(&state).await;
+        let resolved = resolve_pending_reminder(&state).await;
         maybe_send_followup(&state).await;
+        resolved.report(&alive);
 
-        let pending_attempt = {
+        let (pending_attempt, pending_since) = {
             let persisted = state.persisted.lock().await;
-            persisted.pending_reminder.as_ref().map(|p| p.attempt)
+            let pending = persisted.pending_reminder.as_ref();
+            (pending.map(|p| p.attempt), pending.map(|p| p.created_at))
         };
+        // Due: the reminder still being delivered, or the next one.
+        let due = pending_since
+            .unwrap_or_else(|| next_reminder_datetime(reminder_now(), target_time).to_utc());
+        alive.next_due(Some(due.into()));
         let sleep_dur = match pending_attempt {
             Some(attempt) => backoff_delay(attempt),
             None => {

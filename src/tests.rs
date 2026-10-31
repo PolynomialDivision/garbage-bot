@@ -1310,3 +1310,31 @@ fn state_written_before_followup_tracking_still_loads() {
     assert!(posted.followup_at.is_none());
     assert!(posted.confirmations[0].reaction_ids.is_empty());
 }
+
+#[test]
+fn scheduler_rounds_are_reported_for_the_status_file() {
+    use mxbot_common::supervise::{report, snapshot, Outcome};
+    let alive = report("reminder scheduler under test");
+    Resolved::NothingPending.report(&alive);
+    Resolved::Delivered.report(&alive);
+    Resolved::NotYet(today()).report(&alive);
+    Resolved::Expired(today()).report(&alive);
+    let task = snapshot()
+        .into_iter()
+        .find(|t| t.name == "reminder scheduler under test")
+        .unwrap();
+    assert_eq!(
+        (
+            task.idle_total,
+            task.ok_total,
+            task.failed_total,
+            task.gave_up_total
+        ),
+        (1, 1, 2, 1)
+    );
+    assert_eq!(task.last_outcome, Some(Outcome::GaveUp));
+    assert_eq!(
+        task.last_err_reason.as_deref(),
+        Some("reminder for 2026-07-20 expired unsent")
+    );
+}
